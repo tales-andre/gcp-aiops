@@ -1,9 +1,5 @@
 # Terraform
 **/.terraform/**
 !**/.terraform.lock.hcl
-
-**/*.tfstate
-**/*.tfstate.*
-**/.terraform.tfstate*
 crash.log
 crash.*.log
