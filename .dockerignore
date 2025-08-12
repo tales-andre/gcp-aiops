@@ -1,0 +1,4 @@
+infraestrutura/
+k8s/
+terraform-docs-samples/
+build.sh

@@ -1,0 +1,541 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Erros Semelhantes – K8s Pod Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
+  <style>
+    /* ===== Ajustes específicos desta página (usa seu styles.css como base) ===== */
+    .toolbar{
+      display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-bottom:12px;
+    }
+    .toolbar .search{ padding:0; border:0; }
+    .toolbar .btn{ width:auto; margin:0; padding:6px 10px; font-size:13px; }
+
+    /* Board (visão geral de grupos) */
+    .board-grid{
+      display:grid; gap:12px;
+      grid-template-columns: repeat(3, minmax(0,1fr));
+      margin-bottom:16px;
+    }
+    @media (max-width:1200px){ .board-grid{ grid-template-columns: repeat(2, minmax(0,1fr)); } }
+    @media (max-width:800px){ .board-grid{ grid-template-columns: 1fr; } }
+
+    .board-card{
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:12px;
+      background: linear-gradient(180deg, rgba(12,23,49,.92), rgba(12,23,49,.86));
+      box-shadow: var(--shadow-1);
+      cursor:pointer;
+      transition: transform .08s ease, box-shadow .15s ease, border-color .15s ease;
+      text-decoration: none; color: inherit;
+    }
+    .board-card:hover{ transform: translateY(-1px); box-shadow: var(--shadow-2); border-color:#2b3b63; }
+    .board-head{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+    .board-title{ font-weight:700; margin-top:4px; }
+
+    /* Severidades no board (usa suas cores base) */
+    .sev-badge{ padding:2px 8px; border-radius:999px; font-size:11px; font-weight:700; border:1px solid var(--border); }
+    .sev-crit{ background: rgba(255,93,108,.12); border-color: rgba(255,93,108,.45); color: #ff909a; }
+    .sev-warn{ background: rgba(245,159,0,.12); border-color: rgba(245,159,0,.45); color: #ffcf66; }
+    .sev-info{ background: rgba(78,140,255,.12); border-color: rgba(78,140,255,.35); color: #b8ccff; }
+
+    .group-meta{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:6px; }
+    .count-badge{
+      display:inline-flex; align-items:center; gap:6px;
+      font-size:12px; padding:2px 8px; border-radius:999px;
+      border:1px solid var(--border); background:#0b162b;
+    }
+
+    /* Pod share bar (mostra quais pods mais contribuem) */
+    .pod-bars{ display:flex; flex-direction:column; gap:6px; margin-top:10px; }
+    .pod-row{ display:flex; align-items:center; gap:8px; }
+    .pod-row .name{ font-size:12px; color:var(--muted); min-width:0; flex: 0 1 40%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .pod-row .bar{
+      --pct: 0%;
+      position:relative; height:10px; border-radius:999px; flex:1;
+      background:#0b162b; border:1px solid var(--border); overflow:hidden;
+    }
+    .pod-row .bar::after{
+      content:""; position:absolute; left:0; top:0; height:100%;
+      width: var(--pct); border-radius:999px;
+      background: linear-gradient(90deg, var(--brand), var(--brand-2));
+      opacity:.85;
+    }
+    .pod-row .val{ font-size:12px; min-width:30px; text-align:right; }
+
+    /* Detalhes/lista */
+    .group-card{ scroll-margin-top: 100px; }
+    .group-head{
+      display:flex; justify-content:space-between; gap:12px; align-items:flex-start;
+    }
+    .group-left{ min-width:0; }
+    .kv-mini{ display:flex; gap:8px; flex-wrap:wrap; font-size:12px; color:var(--muted); }
+    .muted-small{ color:var(--muted); font-size:12px; }
+    .truncate-2{
+      display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;
+    }
+    .table-compact th, .table-compact td{ padding:6px 8px !important; font-size:12px !important; }
+
+    /* Destaques no texto (usa suas classes .hl .crit/.warn) */
+    .hl{ font-weight:700; }
+    .hl.crit{ color: var(--err); }
+    .hl.warn{ color: var(--warn); }
+    .hl.info{ color: var(--brand); }
+  </style>
+</head>
+<body class="page-analysis">
+<header class="appbar">
+  <div class="brand">
+    <div class="logo">⎈</div>
+    <div class="title">Erros Semelhantes (ML)</div>
+  </div>
+  <div class="help">
+    <a class="link" href="{{ url_for('dashboard') }}">← Voltar ao Dashboard</a> •
+    <a class="link" href="{{ url_for('analysis_page') }}">Análise por Clusters</a>
+  </div>
+</header>
+
+<div class="layout" style="grid-template-columns: 360px 1fr;">
+  <aside class="sidebar">
+    <div class="search">
+      <label class="muted" for="ns">Namespaces (opcional, vírgulas)</label>
+      <input id="ns" placeholder="ex.: prod,monitoring" />
+    </div>
+    <div class="search">
+      <label class="muted" for="limit_pods">Qtd. máx. de pods</label>
+      <input id="limit_pods" type="number" value="120" min="5" max="1000"/>
+    </div>
+    <div class="search">
+      <label class="muted" for="tail">Linhas de log por contêiner</label>
+      <input id="tail" type="number" value="600" min="100" max="5000"/>
+    </div>
+    <div class="search">
+      <button id="run" class="btn">Buscar erros semelhantes</button>
+    </div>
+    <div class="search">
+      <div id="summary" class="muted" style="font-size:12px;"></div>
+    </div>
+  </aside>
+
+  <main class="content">
+    <section class="panel">
+      <!-- Toolbar -->
+      <div class="toolbar">
+        <div class="search">
+          <input id="q" placeholder="Filtrar por resumo (texto)"/>
+        </div>
+        <div class="search">
+          <select id="severity">
+            <option value="all">Todas severidades</option>
+            <option value="crit">Apenas críticas</option>
+            <option value="warn">Apenas avisos</option>
+            <option value="info">Apenas informativas</option>
+          </select>
+        </div>
+        <div class="search">
+          <select id="sort">
+            <option value="size">Ordenar: maiores grupos</option>
+            <option value="alpha">Ordenar: A–Z (resumo)</option>
+            <option value="ns">Ordenar: por namespace mais frequente</option>
+          </select>
+        </div>
+        <label class="chip" title="Agrupa por assinatura normalizada (ignora números, UUIDs, etc.)">
+          <input type="checkbox" id="combine" style="margin-right:6px"> Combinar similares
+        </label>
+        <button class="btn" id="exportCsv">Exportar CSV</button>
+      </div>
+
+      <!-- KPIs -->
+      <div id="kpis" class="kpis-wrap">
+        <div class="kpi-grid" id="kpiGrid"></div>
+      </div>
+
+      <!-- Board (visão geral) -->
+      <div id="board" class="board-grid"></div>
+
+      <!-- Lista detalhada -->
+      <div id="groups"></div>
+    </section>
+  </main>
+</div>
+
+<script>
+  const groupsEl   = document.getElementById('groups');
+  const boardEl    = document.getElementById('board');
+  const runBtn     = document.getElementById('run');
+  const nsEl       = document.getElementById('ns');
+  const limitEl    = document.getElementById('limit_pods');
+  const tailEl     = document.getElementById('tail');
+  const summaryEl  = document.getElementById('summary');
+
+  // Toolbar
+  const qEl        = document.getElementById('q');
+  const sortEl     = document.getElementById('sort');
+  const sevEl      = document.getElementById('severity');
+  const combineEl  = document.getElementById('combine');
+  const exportBtn  = document.getElementById('exportCsv');
+
+  let lastData = null;   // json completo retornado pela API
+  let viewData = [];     // groups filtrados/ordenados
+
+  // ===== Limite de exemplos por pod (somente visual) =====
+  const PER_POD_MAX = 10;
+  function limitErrorsPerPod(items, maxPerPod = PER_POD_MAX){
+    const seen = new Map();
+    const out = [];
+    for (const it of (items || [])){
+      const key = `${it.ns}/${it.pod}`;
+      const cnt = seen.get(key) || 0;
+      if (cnt >= maxPerPod) continue;
+      seen.set(key, cnt + 1);
+      out.push(it);
+    }
+    return out;
+  }
+
+  // ---------- Utils ----------
+  function escapeHtml(s){
+    return (s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  function chip(text, cls=''){ return `<span class="chip ${cls}">${escapeHtml(text)}</span>` }
+  function badge(text){ return `<span class="count-badge">${escapeHtml(text)}</span>` }
+
+  // Destaques/Severidade
+  const CRIT_WORDS = [
+    'error','failed','failure','exception','panic','fatal',
+    'permission denied','denied','unauthorized','forbidden',
+    'timeout','timed out','deadline exceeded','crash','segfault'
+  ];
+  const WARN_WORDS = ['warn','warning','deprecated','retry','backoff','throttle','overload','slow'];
+  const INFO_WORDS = ['info','started','connected','ready'];
+
+  function inferSeverity(summary, sampleLine){
+    const t = ((summary||'') + ' ' + (sampleLine||'')).toLowerCase();
+    if (CRIT_WORDS.some(w => t.includes(w))) return 'crit';
+    if (WARN_WORDS.some(w => t.includes(w))) return 'warn';
+    return 'info';
+  }
+
+  // Aplica <span class="hl ..."> nas palavras-chave (em HTML já escapado)
+  function highlightKeywords(html){
+    const apply = (arr, cls, str) => {
+      for (const w of arr){
+        const re = new RegExp(`\\b(${w.replace(/[-/\\^$*+?.()|[\\]{}]/g,'\\$&')})\\b`, 'gi');
+        str = str.replace(re, `<span class="hl ${cls}">$1</span>`);
+      }
+      return str;
+    };
+    let out = html;
+    out = apply(CRIT_WORDS, 'crit', out);
+    out = apply(WARN_WORDS, 'warn', out);
+    out = apply(INFO_WORDS, 'info', out);
+    return out;
+  }
+
+  // Normaliza para "assinatura" (ignora números, hex, uuids, timestamps)
+  function normalizeSignature(txt=''){
+    let s = (txt || '').toLowerCase();
+    s = s.replace(/\b\d+\b/g, '<num>');
+    s = s.replace(/\b[0-9a-f]{8,}\b/g, '<hex>');          // hex longas
+    s = s.replace(/[0-9a-f-]{36}/g, '<uuid>');            // UUID
+    s = s.replace(/\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?z?/g, '<ts>'); // ISO ts
+    s = s.replace(/\s+/g, ' ').trim();
+    return s;
+  }
+
+  function combineSimilarGroups(groups){
+    const bucket = new Map();
+    for (const g of groups){
+      const sig = normalizeSignature(g.summary || '');
+      const key = [sig, g.type || '', g.entity || ''].join('|');
+      if (!bucket.has(key)){
+        bucket.set(key, {
+          summary: g.summary,
+          type: g.type,
+          entity: g.entity,
+          enrichment: g.enrichment,
+          items: [...(g.items||[])],
+          _signatures: new Set([sig]),
+          pods: g.pods ? [...g.pods] : undefined
+        });
+      } else {
+        const tgt = bucket.get(key);
+        tgt.items.push(...(g.items||[]));
+        if ((g.summary||'').length > (tgt.summary||'').length) tgt.summary = g.summary;
+        tgt._signatures.add(sig);
+        if (g.pods){
+          if (!tgt.pods) tgt.pods = [];
+          tgt.pods.push(...g.pods);
+        }
+      }
+    }
+    // dedup pods combinados
+    return [...bucket.values()].map(g => {
+      if (g.pods){ g.pods = [...new Set(g.pods)]; }
+      return g;
+    });
+  }
+
+  function topCounts(arr, key, limit=3){
+    const m = new Map();
+    arr.forEach(x => m.set(x[key], (m.get(x[key])||0)+1));
+    const sorted = [...m.entries()].sort((a,b)=> b[1]-a[1]).slice(0, limit);
+    return sorted;
+  }
+
+  // KPIs topo
+  function renderKpis(groups){
+    const kpiGrid = document.getElementById('kpiGrid');
+    const totalGroups = groups.length;
+    const totalItems  = groups.reduce((acc,g)=> acc + (g.items?.length||0), 0);
+    const nsSet = new Set(); const podSet = new Set();
+    groups.forEach(g => (g.items||[]).forEach(it => { nsSet.add(it.ns); podSet.add(it.pod); }));
+
+    kpiGrid.innerHTML = `
+      <div class="kpi"><div class="label">Grupos</div><div class="value">${totalGroups}</div></div>
+      <div class="kpi"><div class="label">Ocorrências</div><div class="value">${totalItems}</div></div>
+      <div class="kpi"><div class="label">Namespaces</div><div class="value">${nsSet.size}</div></div>
+      <div class="kpi"><div class="label">Pods</div><div class="value">${podSet.size}</div></div>
+      <div class="kpi"><div class="label">Combinação</div><div class="value">${combineEl.checked ? 'Ligada' : 'Desligada'}</div></div>
+    `;
+  }
+
+  // --------- Render Board (visão rápida) ---------
+  function renderBoard(groups){
+    if (!groups.length){ boardEl.innerHTML = ''; return; }
+    const html = groups.map((g, idx)=>{
+      const items = g.items || [];
+      const count = items.length;
+      const sample = items[0] || {};
+      const sev = inferSeverity(g.summary, sample.line);
+      const sevCls = sev === 'crit' ? 'sev-crit' : (sev === 'warn' ? 'sev-warn' : 'sev-info');
+
+      // Top pods e barra de participação
+      const podTop = topCounts(items, 'pod', 4);
+      const maxV = podTop.length ? podTop[0][1] : 1;
+
+      const podBars = podTop.map(([pod,v])=>{
+        const pct = Math.round((v / maxV) * 100) + '%';
+        return `
+          <div class="pod-row">
+            <div class="name" title="${escapeHtml(pod)}">${escapeHtml(pod)}</div>
+            <div class="bar" style="--pct:${pct}" aria-label="${v}/${maxV}"></div>
+            <div class="val">${v}</div>
+          </div>`;
+      }).join('');
+
+      // Título com destaque
+      const title = highlightKeywords(escapeHtml(g.summary || '(sem resumo)'));
+
+      return `
+        <a class="board-card" href="#group-${idx}" title="Abrir detalhes">
+          <div class="board-head">
+            <span class="sev-badge ${sevCls}">${sev.toUpperCase()}</span>
+            <span class="count-badge">${count} ocorrências</span>
+          </div>
+          <div class="board-title truncate-2" style="margin-bottom:6px;">${title}</div>
+          <div class="group-meta">
+            ${chip(g.type || 'sem-tipo')}
+            ${chip(g.entity || 'sem-entidade')}
+          </div>
+          <div class="pod-bars">${podBars || '<span class="muted-small">Sem pods destacados</span>'}</div>
+        </a>
+      `;
+    }).join('');
+    boardEl.innerHTML = html;
+  }
+
+  // --------- Render Lista Detalhada ---------
+  function renderGroups(groups){
+    if (!groups.length){
+      groupsEl.innerHTML = '<div class="muted">Nenhum agrupamento de erro encontrado.</div>';
+      renderKpis(groups); renderBoard(groups);
+      return;
+    }
+
+    const html = groups.map((g, idx) => {
+      const items = g.items || [];
+      const totalCount = items.length;
+      const limitedItems = limitErrorsPerPod(items);
+      const shownCount = limitedItems.length;
+      const sample = items[0] || {};
+      const sev = inferSeverity(g.summary, sample.line);
+      const sevPillClass = sev === 'crit' ? 'pill err' : (sev === 'warn' ? 'pill warn' : 'pill');
+
+      // Top namespaces/pods
+      const topNs  = topCounts(items, 'ns', 3).map(([k,v]) => chip(`${k} (${v})`)).join(' ');
+      const topPod = topCounts(items, 'pod', 5).map(([k,v]) => chip(`${k} (${v})`)).join(' ');
+
+      // Resumo e descrição com destaque
+      const title = highlightKeywords(escapeHtml(g.summary || '(sem resumo)'));
+      const desc = (g.enrichment && g.enrichment.description)
+        ? `<div class="muted-small truncate-2">${highlightKeywords(escapeHtml(g.enrichment.description))}</div>`
+        : '';
+
+      return `
+        <div class="cluster-card group-card" id="group-${idx}">
+          <div class="group-head">
+            <div class="group-left">
+              <div class="meta-line" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+                ${chip(g.type || 'sem-tipo')}
+                ${chip(g.entity || 'sem-entidade')}
+                <span class="${sevPillClass}" title="Severidade inferida">${sev.toUpperCase()}</span>
+                ${badge(totalCount + ' ocorrências')}
+              </div>
+              <div class="stack" style="margin-top:6px;">
+                <div class="truncate-2"><strong>${title}</strong></div>
+                ${desc}
+                <div class="kv-mini" style="margin-top:4px;">
+                  <span>Top NS:</span> <span>${topNs || '-'}</span>
+                </div>
+                <div class="kv-mini">
+                  <span>Pods:</span> <span>${topPod || '-'}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <details>
+            <summary>Ver exemplos (${shownCount} de ${totalCount} — máx ${PER_POD_MAX}/pod)</summary>
+            <div class="cluster-members" style="margin-top:8px;">
+              <div class="table-wrap">
+                <table class="table-compact">
+                  <thead><tr><th>Namespace</th><th>Pod</th><th>Linha</th></tr></thead>
+                  <tbody>
+                    ${limitedItems.map(it => {
+                      const line = highlightKeywords(escapeHtml(it.line || ''));
+                      return `
+                        <tr>
+                          <td>${escapeHtml(it.ns)}</td>
+                          <td>${escapeHtml(it.pod)}</td>
+                          <td style="white-space: pre-wrap;">${line}</td>
+                        </tr>`;
+                    }).join('')}
+                  </tbody>
+                </table>
+              </div>
+              <div class="muted-small" style="margin-top:6px;">
+                Exibindo no máximo ${PER_POD_MAX} linhas por pod nesta visualização.
+              </div>
+            </div>
+          </details>
+        </div>
+      `;
+    }).join('');
+
+    groupsEl.innerHTML = html;
+    renderKpis(groups);
+    renderBoard(groups);
+  }
+
+  function applyView(){
+    if (!lastData){ groupsEl.innerHTML = '<div class="muted">Carregue os dados para ver os grupos.</div>'; boardEl.innerHTML=''; return; }
+    const raw = lastData.groups || [];
+
+    // Combina similares?
+    let groups = combineEl.checked ? combineSimilarGroups(raw) : raw.map(g => ({...g}));
+
+    // Filtro por texto (resumo)
+    const q = (qEl.value || '').trim().toLowerCase();
+    if (q){
+      groups = groups.filter(g => (g.summary || '').toLowerCase().includes(q));
+    }
+
+    // Filtro por severidade
+    const sevChoice = sevEl.value;
+    if (sevChoice !== 'all'){
+      groups = groups.filter(g => {
+        const items = g.items || [];
+        const sample = items[0] || {};
+        const sev = inferSeverity(g.summary, sample.line);
+        return sev === sevChoice;
+      });
+    }
+
+    // Ordenação
+    if (sortEl.value === 'size'){
+      groups.sort((a,b)=> (b.items?.length||0) - (a.items?.length||0));
+    } else if (sortEl.value === 'alpha'){
+      groups.sort((a,b)=> (a.summary||'').localeCompare(b.summary||''));
+    } else if (sortEl.value === 'ns'){
+      const score = (g)=>{
+        const top = topCounts(g.items||[], 'ns', 1);
+        return top.length ? top[0][1] : 0;
+      };
+      groups.sort((a,b)=> score(b) - score(a));
+    }
+
+    viewData = groups;
+    renderGroups(viewData);
+  }
+
+  async function runSearch(){
+    groupsEl.innerHTML = '<div class="muted">Processando…</div>';
+    boardEl.innerHTML = '';
+    const params = new URLSearchParams();
+    if (nsEl.value.trim()) params.set('ns', nsEl.value.trim());
+    params.set('limit_pods', limitEl.value || '120');
+    params.set('tail', tailEl.value || '600');
+    params.set('item_limit', '0'); // 0 = pedir sem limite, caso o backend suporte
+    const r = await fetch('/api/ml/errors?' + params.toString());
+    if (!r.ok){
+      const txt = await r.text().catch(()=> '');
+      groupsEl.innerHTML = `<div class="muted">Falha: HTTP ${r.status} — ${escapeHtml(txt)}</div>`;
+      return;
+    }
+    const data = await r.json();
+    lastData = data;
+    const p = data.params || {};
+    summaryEl.textContent = `Params: ns=${(p.ns||[]).join(',') || 'todos'} • limit=${p.limit_pods} • tail=${p.tail}` + (p.item_limit !== undefined ? ` • item_limit=${p.item_limit}` : '');
+    applyView();
+  }
+
+  // Export CSV (todos os itens vindos da API, sem o limite visual por pod)
+  function exportCsvFrom(groups){
+    const rows = [];
+    rows.push(['severity','count','type','entity','summary','sample_ns','sample_pod','sample_line']);
+    for (const g of groups){
+      const items = g.items || [];
+      const sample = items[0] || {};
+      const sev = inferSeverity(g.summary, sample.line);
+      rows.push([
+        sev,
+        items.length,
+        g.type || '',
+        g.entity || '',
+        (g.summary || '').replace(/\s+/g,' ').trim(),
+        sample.ns || '',
+        sample.pod || '',
+        (sample.line || '').replace(/\s+/g,' ').trim()
+      ]);
+    }
+    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'ml_errors_groups.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // Eventos UI
+  runBtn.addEventListener('click', runSearch);
+  qEl.addEventListener('input', applyView);
+  sortEl.addEventListener('change', applyView);
+  sevEl.addEventListener('change', applyView);
+  combineEl.addEventListener('change', applyView);
+  exportBtn.addEventListener('click', ()=> exportCsvFrom(viewData));
+
+  // Auto-run ao entrar na página (para ter visão imediata)
+  runSearch();
+</script>
+</body>
+</html>

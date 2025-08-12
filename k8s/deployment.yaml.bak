@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-dashboard
+  namespace: aiops-dashboard
+spec:
+  # ─────────── ESCALONAMENTO BÁSICO ───────────
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-dashboard
+  template:
+    metadata:
+      labels:
+        app: k8s-dashboard
+    spec:
+      serviceAccountName: dashboard-sa
+      # ─────────── CONTAINER ───────────
+      containers:
+        - name: dashboard
+          image: us-central1-docker.pkg.dev/logical-light-467511-n0/dash-repo/dashboard:1.48
+
+          ports:
+            - containerPort: 8080
+          env:
+            - { name: PORT, value: "8080" }
+            # desliga LLM pesado → responde com bullets
+            - { name: USE_LLM, value: "0" }
+            # não reconstrói index toda hora
+            - { name: BUILD_INDEX_ON_START, value: "0" }
+          # diretório em memória p/ index FAISS (rápido + auto-limpo)
+          volumeMounts:
+            - { name: index-tmp, mountPath: /index }
+            - { name: data,      mountPath: /data }
+          # ──────── RECURSOS (Autopilot = request==limit) ────────
+          resources:
+            requests:
+              cpu: "3500m"            # ~1,5 vCPU
+              memory: "4Gi"
+              ephemeral-storage: "4Gi"
+            limits:
+              cpu: "3500m"
+              memory: "4Gi"
+              ephemeral-storage: "4Gi"
+      # ─────────── VOLUMES ───────────
+      volumes:
+        - name: index-tmp
+          emptyDir: { medium: Memory }  # evita I/O em disco
+        - name: data
+          emptyDir: {}                  # seus uploads / histórico

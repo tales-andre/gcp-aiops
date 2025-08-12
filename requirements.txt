@@ -1,0 +1,10 @@
+flask
+gevent
+kubernetes
+numpy
+scikit-learn
+matplotlib
+faiss-cpu
+sentence-transformers
+torch
+flask-compress

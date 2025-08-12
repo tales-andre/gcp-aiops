@@ -1,0 +1,1255 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>K8s Pod Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
+  <style>
+    /* Chat – alinhado ao tema escuro; não sobrescreve com branco */
+    .chat-wrap { display:flex; flex-direction:column; gap:10px; }
+  
+    .chat-messages{
+      border:1px solid var(--border);
+      border-radius:8px;
+      padding:10px;
+      height:320px;
+      overflow:auto;
+      background:var(--surface);
+      color:var(--text);
+    }
+  
+    .chat-msg{ margin:6px 0; max-width:100%; }
+    .chat-msg.role-user{ text-align:right; }
+  
+    .chat-bubble{
+      display:inline-block;
+      padding:8px 10px;
+      border-radius:10px;
+      white-space:pre-wrap;
+      background:#0f1a30;
+      color:var(--text);
+      border:1px solid rgba(78,140,255,.22);
+    }
+    .chat-msg.role-user .chat-bubble{
+      background:linear-gradient(180deg,#1a2b52,#142347);
+    }
+    .chat-msg.role-assistant .chat-bubble{
+      background:#0f1a30;
+    }
+  
+    .chat-input-row{ display:flex; gap:8px; align-items:center; }
+    .chat-input-row input[type="text"]{ flex:1; }
+  
+    .chat-hints{ display:flex; flex-wrap:wrap; gap:6px; }
+    .chat-hints .hint{
+      border:1px dashed #38538f;
+      background:#102448;
+      color:#cfe0ff;
+      border-radius:14px;
+      padding:4px 8px;
+      cursor:pointer;
+      font-size:12px;
+    }
+  </style>
+  
+</head>
+<body class="page-dashboard">
+<header class="appbar">
+  <div class="brand">
+    <div class="logo">⎈</div>
+    <div class="title">K8s Pod Dashboard</div>
+  </div>
+  <div class="help">
+    <a class="link" href="{{ url_for('analysis_page') }}">Análise ML</a> •
+    <a class="link" href="{{ url_for('ml_errors_page') }}">Erros Semelhantes</a> •
+    <span class="kbd">/</span> focus • <span class="kbd">↑/↓</span> navigate • <span class="kbd">Enter</span> open •
+    <span class="kbd">Esc</span> clear • filtros:
+    <code>ns:</code> <code>label:</code> <code>phase:</code> <code>node:</code> <code>owner:</code> <code>name:</code>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="search">
+      <input id="q" placeholder='Busque pods (ex.: ns:prod label:app=api phase:Running) — Ctrl/Cmd+K' />
+    </div>
+    <div id="pod-list" class="list" tabindex="0"></div>
+  </aside>
+
+  <main class="content">
+    <div class="header">
+      <div class="titleline">
+        <strong id="title">Selecione um pod</strong>
+        <span id="phase" class="badge"></span>
+      </div>
+      <div class="muted" id="ns"></div>
+    </div>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="overview">Visão geral</div>
+      <div class="tab" data-tab="logs">Logs</div>
+      <div class="tab" data-tab="events">Eventos</div>
+      <div class="tab" data-tab="network">Rede</div>
+      <div class="tab" data-tab="storage">Armazenamento</div>
+      <div class="tab" data-tab="solutions">Soluções</div>
+      <div class="tab" data-tab="chat">Chat</div>
+      <div class="tab" data-tab="last-run">Última execução</div>
+    </div>
+
+    <section class="panel" id="panel-overview">
+      <div class="kv"><div>Pod IP</div><div id="pod_ip"></div></div>
+      <div class="kv"><div>Node</div><div id="node"></div></div>
+      <div class="kv"><div>Host IP</div><div id="host_ip"></div></div>
+      <div class="kv"><div>Reinícios</div><div id="restarts"></div></div>
+      <div class="kv"><div>Início</div><div id="start_time"></div></div>
+      <h4>Contêineres</h4>
+      <ul id="containers" class="pill-list"></ul>
+    </section>
+
+    <section class="panel" id="panel-logs" style="display:none;">
+      <pre id="logs" class="code"></pre>
+    </section>
+
+    <section class="panel" id="panel-events" style="display:none;">
+      <ul id="events" class="events"></ul>
+    </section>
+
+    <section class="panel" id="panel-network" style="display:none;">
+      <h4>Services</h4>
+      <ul id="services"></ul>
+      <h4>Endpoints</h4>
+      <ul id="endpoints"></ul>
+      <h4>Ingresses</h4>
+      <ul id="ingresses"></ul>
+    </section>
+
+    <section class="panel" id="panel-storage" style="display:none;">
+      <h4>PVCs</h4>
+      <ul id="pvcs"></ul>
+    </section>
+
+    <!-- Soluções -->
+    <section class="panel" id="panel-solutions" style="display:none;">
+      <div class="row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
+        <button id="btnNewSolution" class="btn">+ Nova solução</button>
+        <span class="muted tiny">Dica: esta aba usa seu <strong>dataset.json</strong>; o <strong>Chat</strong> usa <code>dataset_chatbot.json</code>.</span>
+      </div>
+      <div id="solutions_wrap"></div>
+    </section>
+
+    <!-- Chat -->
+    <section class="panel" id="panel-chat" style="display:none;">
+      <div class="chat-wrap">
+        <div class="chat-hints">
+          <span class="hint" data-hint="O que significa OOMKilled?">O que significa OOMKilled?</span>
+          <span class="hint" data-hint="Como corrigir timeouts?">Como corrigir timeouts?</span>
+          <span class="hint" data-hint="DNS falhando">DNS falhando</span>
+          <span class="hint" data-hint="ImagePullBackOff no deploy">ImagePullBackOff</span>
+          <span class="hint" data-hint="RBAC: permission denied">RBAC: permission denied</span>
+        </div>
+
+        <div class="chat-messages" id="chatMessages"></div>
+
+        <div class="chat-input-row">
+          <input id="chatInput" type="text" class="input" placeholder="Pergunte algo… (chat usa dataset do chatbot; substitui &lt;ns&gt;/&lt;pod&gt; se um pod estiver selecionado)">
+          <button id="chatSend" class="btn">Enviar</button>
+        </div>
+        <div class="muted tiny">Se nenhum pod estiver selecionado, o chat responde sem substituir &lt;ns&gt;/&lt;pod&gt;.</div>
+      </div>
+    </section>
+
+    <!-- Última Execução -->
+    <section class="panel" id="panel-last-run" style="display:none;">
+      <div class="row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <button id="btnLastRunRefresh" class="btn">Atualizar última execução</button>
+        <button id="btnLastRunSnapshot" class="btn" disabled>Abrir snapshot salvo</button>
+        <span id="lastRunMeta" class="muted" style="font-size:12px;"></span>
+      </div>
+
+      <h4 style="margin-top:12px;">Containers – última execução</h4>
+      <div id="lastRunContainers"></div>
+
+      <h4 style="margin-top:12px;">Eventos (recorte)</h4>
+      <ul id="lastRunEvents" class="events"></ul>
+
+      <details id="snapshotBlock" style="margin-top:14px; display:none;">
+        <summary><strong>Snapshot salvo</strong> <span class="muted">(conteúdo do arquivo salvo)</span></summary>
+        <div id="snapshotContent" style="margin-top:8px;"></div>
+      </details>
+    </section>
+  </main>
+</div>
+
+<!-- Dialogs (Editar/Novo) -->
+<dialog id="dlgEdit" style="max-width: 760px; width: 92%;">
+  <form method="dialog" id="dlgEditForm" style="display:grid;gap:12px;">
+    <h3>Editar solução</h3>
+    <input type="hidden" id="dlgEdit_sid">
+    <label>
+      <div class="muted">Erro (título curto)</div>
+      <input id="dlgEdit_error" class="input">
+    </label>
+
+    <label>
+      <div class="muted" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        Identificação do erro (linhas que devem acionar esta solução)
+        <span class="muted tiny">— escolha <strong>Palavras-chave</strong> ou <strong>Regex avançado</strong></span>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-left:auto;">
+          <input type="checkbox" id="dlgEdit_unlock_patterns">
+          permitir edição
+        </label>
+      </div>
+
+      <div class="pattern-mode">
+        <button type="button" class="seg selected" data-mode="simple" data-scope="edit">Palavras-chave</button>
+        <button type="button" class="seg" data-mode="regex" data-scope="edit">Regex avançado</button>
+      </div>
+
+      <div class="pattern-wrap" data-scope="edit" data-mode="simple">
+        <div class="tags-input" id="dlgEdit_tags" data-disabled="true"></div>
+        <div class="muted tiny">Ex.: <code>timeout</code>, <code>connection refused</code>, <code>no such host</code>. Digite e pressione <strong>Enter</strong> para adicionar uma palavra, ou clique nas sugestões.</div>
+        <div class="sugg-row" id="dlgEdit_suggestions"></div>
+      </div>
+
+      <div class="pattern-wrap" data-scope="edit" data-mode="regex" hidden>
+        <textarea id="dlgEdit_patterns" class="input" rows="3" disabled></textarea>
+        <div class="muted tiny">Uma <strong>regex por linha</strong>. Use grupos e flags conforme necessário (case-insensitive é aplicado automaticamente). Você pode prefixar com <code>re:</code> — aplicaremos ao salvar.</div>
+      </div>
+
+      <div class="pattern-test">
+        <textarea id="dlgEdit_test" class="input" rows="2" placeholder="Cole aqui 1 ou mais linhas de erro para testar"></textarea>
+        <div class="test-row">
+          <button type="button" id="dlgEdit_test_btn" class="btn btn-sm">Testar</button>
+          <span id="dlgEdit_test_out" class="muted tiny"></span>
+        </div>
+      </div>
+    </label>
+
+    <label>
+      <div class="editor-toolbar">
+        <div class="muted">Solução</div>
+        <div>
+          <button type="button" id="dlgEdit_expand" class="btn btn-sm btn-ghost">Tela cheia</button>
+        </div>
+      </div>
+      <div class="editor-wrap">
+        <textarea id="dlgEdit_solution" class="input editor-input" rows="12" placeholder="Escreva a solução… (aceita Markdown básico)"></textarea>
+      </div>
+      <div class="muted" style="font-size:12px;">Dica: use <strong>Ctrl/Cmd+Enter</strong> para salvar.</div>
+    </label>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button type="submit" value="cancel" class="btn">Cancelar</button>
+      <button id="dlgEdit_save" class="btn">Salvar</button>
+    </div>
+    <div id="dlgEdit_msg" class="muted" style="font-size:12px;"></div>
+  </form>
+</dialog>
+
+<dialog id="dlgNew" style="max-width: 760px; width: 92%;">
+  <form method="dialog" id="dlgNewForm" style="display:grid;gap:12px;">
+    <h3>Nova solução</h3>
+    <label>
+      <div class="muted">Erro (título curto)</div>
+      <input id="dlgNew_error" class="input" placeholder="Ex.: timeout ao chamar service X">
+    </label>
+
+    <label>
+      <div class="muted">Identificação do erro (linhas que devem acionar esta solução)</div>
+      <div class="pattern-mode">
+        <button type="button" class="seg selected" data-mode="simple" data-scope="new">Palavras-chave</button>
+        <button type="button" class="seg" data-mode="regex" data-scope="new">Regex avançado</button>
+      </div>
+
+      <div class="pattern-wrap" data-scope="new" data-mode="simple">
+        <div class="tags-input" id="dlgNew_tags"></div>
+        <div class="muted tiny">Use <strong>palavras/trechos exatamente como aparecem na linha de erro</strong>. Digite e pressione <strong>Enter</strong> para adicionar; cada tag vira um padrão separado.</div>
+        <div class="sugg-row" id="dlgNew_suggestions"></div>
+        <details class="tiny" style="margin-top:6px;">
+          <summary>Exemplos rápidos</summary>
+          <div class="muted tiny">
+            • <code>context deadline exceeded</code> • <code>connection refused</code> • <code>no such host</code> • <code>ImagePullBackOff</code> • <code>OOMKilled</code> • <code>readiness probe failed</code> • <code>permission denied</code>
+          </div>
+        </details>
+      </div>
+
+      <div class="pattern-wrap" data-scope="new" data-mode="regex" hidden>
+        <textarea id="dlgNew_patterns" class="input" rows="4" placeholder="Uma regex por linha, ex.:
+(?:i/o timeout|context deadline exceeded)
+no endpoints available
+ImagePullBackOff"></textarea>
+        <div class="muted tiny">Uma <strong>regex por linha</strong>. O prefixo <code>re:</code> é opcional (aplicaremos ao salvar).</div>
+      </div>
+
+      <div class="pattern-test">
+        <textarea id="dlgNew_test" class="input" rows="2" placeholder="Cole aqui 1 ou mais linhas de erro para testar"></textarea>
+        <div class="test-row">
+          <button type="button" id="dlgNew_test_btn" class="btn btn-sm">Testar</button>
+          <span id="dlgNew_test_out" class="muted tiny"></span>
+        </div>
+      </div>
+    </label>
+
+    <label>
+      <div class="editor-toolbar">
+        <div class="muted">Solução</div>
+        <div>
+          <button type="button" id="dlgNew_expand" class="btn btn-sm btn-ghost">Tela cheia</button>
+        </div>
+      </div>
+      <div class="editor-wrap">
+        <textarea id="dlgNew_solution" class="input editor-input" rows="12" placeholder="Passos de correção, links internos… (aceita Markdown básico)"></textarea>
+      </div>
+      <div class="muted" style="font-size:12px;">Dica: use <strong>Ctrl/Cmd+Enter</strong> para salvar.</div>
+    </label>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button type="submit" value="cancel" class="btn">Cancelar</button>
+      <button id="dlgNew_save" class="btn">Salvar</button>
+    </div>
+    <div id="dlgNew_msg" class="muted" style="font-size:12px;"></div>
+  </form>
+</dialog>
+
+<script>
+  // Tabs
+  document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+      const target = t.dataset.tab;
+      document.querySelectorAll('.panel').forEach(p => p.style.display = 'none');
+      document.querySelector('#panel-' + target).style.display = 'block';
+      if (target === 'last-run' && window.currentPodNamespace && window.currentPodName) {
+        refreshLastRun();
+      }
+    });
+  });
+
+  // Highlight helpers
+  function escapeHtml(s){
+    return (s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  // Palavras críticas (erros/falhas conhecidos)
+  const CRIT_PATTERNS = [
+    /\berror\b/gi, /\berro\b/gi, /\bfailed\b/gi, /\bfail\b/gi,
+    /\bexception\b/gi, /\bpanic\b/gi, /\bdenied\b/gi,
+    /\bunauthorized\b/gi, /\bforbidden\b/gi,
+    /\boomkilled\b/gi, /\bout of memory\b/gi,
+    /\bcrashloopbackoff\b/gi, /\bcrash(loop|ed|ing)?\b/gi,
+    /\btimeout\b/gi, /\bi\/o timeout\b/gi, /\bcontext deadline exceeded\b/gi,
+    /\bconnection refused\b/gi,
+    /\bno such host\b/gi, /\bcould not resolve host\b/gi,
+    /\btemporary failure in name resolution\b/gi,
+    /\bno endpoints available\b/gi,
+    /\bimagepullbackoff\b/gi, /\berrimagepull\b/gi,
+    /\breadiness probe failed\b/gi, /\bliveness probe failed\b/gi, /\bstartup probe failed\b/gi,
+    /\bpermission denied\b/gi, /\brbac\b/gi
+  ];
+
+  // Avisos
+  const WARN_PATTERNS = [
+    /\bwarn(ing)?\b/gi, /\bdeprecat(ed|ion)\b/gi, /\bretry(ing)?\b/gi,
+    /\bback[- ]?off\b/gi, /\bslow\b/gi
+  ];
+
+  function highlightText(raw){
+    let html = escapeHtml(raw || "");
+    CRIT_PATTERNS.forEach(rx => { html = html.replace(rx, m => `<span class="hl crit">${m}</span>`); });
+    WARN_PATTERNS.forEach(rx => { html = html.replace(rx, m => `<span class="hl warn">${m}</span>`); });
+    return html;
+  }
+
+  /* ---------------------------
+     Markdown leve para Soluções
+     --------------------------- */
+  function markdownToHtml(md, { withHighlight = false } = {}){
+    md = md == null ? '' : String(md);
+
+    // 1) Escapa tudo
+    let html = escapeHtml(md);
+
+    // 2) Protege blocos ``` ``` e códigos inline `...`
+    const codeBlocks = [];
+    html = html.replace(/```([\s\S]*?)```/g, (m, code) => {
+      const idx = codeBlocks.push(code) - 1;
+      return `@@CODEBLOCK_${idx}@@`;
+    });
+
+    const inlineCodes = [];
+    html = html.replace(/`([^`\n]+)`/g, (m, code) => {
+      const idx = inlineCodes.push(code) - 1;
+      return `@@INLINECODE_${idx}@@`;
+    });
+
+    // 3) (opcional) Highlight SOMENTE no texto comum (placeholders protegem códigos)
+    if (withHighlight){
+      CRIT_PATTERNS.forEach(rx => { html = html.replace(rx, m => `<span class="hl crit">${m}</span>`); });
+      WARN_PATTERNS.forEach(rx => { html = html.replace(rx, m => `<span class="hl warn">${m}</span>`); });
+    }
+
+    // 4) Render Markdown leve
+    html = html.replace(/(^|\n)>[ \t]?(.*)(?=\n|$)/g, (m, br, txt) => `${br}<blockquote>${txt}</blockquote>`);
+    html = html.replace(/^\s*---\s*$/gm, '<hr>');
+    html = html.replace(/^(#{1,4})[ \t]+(.+)$/gm, (m, h, t) => `<h${h.length}>${t}</h${h.length}>`);
+    html = html.replace(/(?:^(?:-|\*)[ \t].*(?:\n|$))+/gm, block => {
+      const items = block.trim().split(/\n/).map(l => l.replace(/^(?:-|\*)[ \t](.*)$/, '<li>$1</li>')).join('');
+      return `<ul>${items}</ul>`;
+    });
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+
+    // 5) Parágrafos
+    const parts = html.split(/\n{2,}/).map(seg => {
+      const trimmed = seg.trim();
+      if (!trimmed) return '';
+      if (/^<(h\d|ul|ol|li|blockquote|pre|hr)/.test(trimmed)) return trimmed;
+      return `<p>${trimmed.replace(/\n/g, '<br>')}</p>`;
+    }).filter(Boolean);
+    html = parts.join('\n');
+
+    // 6) Restaura códigos
+    html = html.replace(/@@CODEBLOCK_(\d+)@@/g, (m, i) => `<pre class="code">${codeBlocks[+i] || ''}</pre>`);
+    html = html.replace(/@@INLINECODE_(\d+)@@/g, (m, i) => `<code>${inlineCodes[+i] || ''}</code>`);
+
+    return html;
+  }
+
+  // Search & list
+  const podListEl = document.getElementById('pod-list');
+  const qEl = document.getElementById('q');
+  let results = [], selectedIndex = -1, debounceId = null;
+
+  function statusClass(phase) {
+    const p = (phase || '').toLowerCase();
+    if (p === 'running') return 'running';
+    if (p === 'pending') return 'pending';
+    if (p === 'failed') return 'failed';
+    if (p === 'succeeded') return 'running';
+    return 'muted';
+  }
+
+  function renderList() {
+    podListEl.innerHTML = results.map((p, i) => `
+      <div class="pod${i === selectedIndex ? ' selected' : ''}" data-idx="${i}">
+        <div class="row1">
+          <strong>${p.name}</strong>
+          <span class="badge ${statusClass(p.phase)}">${p.phase}</span>
+        </div>
+        <div class="row2 muted">${p.namespace} • idade ${p.age} • reinícios ${p.restarts}</div>
+      </div>
+    `).join('');
+  }
+
+  podListEl.addEventListener('click', (e) => {
+    const el = e.target.closest('.pod');
+    if (!el) return;
+    const i = Number(el.dataset.idx);
+    selectIndex(i);
+    openSelected();
+  });
+
+  function selectIndex(i) {
+    if (i < 0) i = 0;
+    if (i >= results.length) i = results.length - 1;
+    if (selectedIndex >= 0 && selectedIndex < podListEl.children.length) {
+      podListEl.children[selectedIndex].classList.remove('selected');
+    }
+    selectedIndex = i;
+    const curr = podListEl.children[selectedIndex];
+    if (curr) {
+      curr.classList.add('selected');
+      curr.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  async function runSearch(q = '') {
+    const r = await fetch('/api/pods?q=' + encodeURIComponent(q));
+    const data = await r.json();
+    results = data.pods || [];
+    selectedIndex = results.length ? 0 : -1;
+    renderList();
+  }
+
+  function debouncedSearch(){
+    clearTimeout(debounceId);
+    debounceId = setTimeout(()=>runSearch(qEl.value), 300);
+  }
+
+  function openSelected(){
+    if (selectedIndex<0 || selectedIndex>=results.length) return;
+    const p = results[selectedIndex];
+    loadPod(p.namespace, p.name);
+  }
+
+  qEl.addEventListener('input', debouncedSearch);
+  qEl.addEventListener('keydown', (e) => {
+    if (e.key==='ArrowDown'){ e.preventDefault(); selectIndex(selectedIndex+1); }
+    if (e.key==='ArrowUp'){ e.preventDefault(); selectIndex(selectedIndex-1); }
+    if (e.key==='Enter'){ e.preventDefault(); openSelected(); }
+    if (e.key==='Escape'){ e.preventDefault(); qEl.value=''; runSearch(''); }
+  });
+  window.addEventListener('keydown', e => {
+    if (e.key === '/') { e.preventDefault(); qEl.focus(); }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault(); qEl.focus(); qEl.select();
+    }
+  });
+
+  runSearch('');
+
+  // ---------- Helpers editor ----------
+  function autosize(el){
+    if(!el) return;
+    const min = parseInt(getComputedStyle(el).getPropertyValue('--editor-min-height') || 0, 10) || 180;
+    el.style.height = 'auto';
+    const h = Math.max(el.scrollHeight + 2, min);
+    el.style.height = h + 'px';
+  }
+  function bindAutosize(el){
+    if(!el) return;
+    autosize(el);
+    el.addEventListener('input', () => autosize(el));
+  }
+  function bindFullscreen(dialogEl, btnEl){
+    if(!dialogEl || !btnEl) return;
+    btnEl.addEventListener('click', (e) => {
+      e.preventDefault();
+      dialogEl.classList.toggle('fullscreen');
+      btnEl.textContent = dialogEl.classList.contains('fullscreen') ? 'Sair da tela cheia' : 'Tela cheia';
+      const ta = dialogEl.querySelector('.editor-input');
+      if (ta) requestAnimationFrame(() => autosize(ta));
+    });
+  }
+  function bindSaveOnShortcut(textareaEl, saveBtnEl){
+    if(!textareaEl || !saveBtnEl) return;
+    textareaEl.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter'){
+        e.preventDefault();
+        saveBtnEl.click();
+      }
+    });
+  }
+
+  // ---------- TagsInput ----------
+  class TagsInput {
+    constructor(rootEl, {placeholder='Digite e Enter…', disabled=false}={}) {
+      this.root = rootEl;
+      this.tags = [];
+      this.disabled = !!disabled;
+      this.input = document.createElement('input');
+      this.input.className = 'tags-input-edit';
+      this.input.placeholder = placeholder;
+      this.root.classList.add('tags-input-ready');
+      this.root.appendChild(this.input);
+      this._bind();
+      this._refreshDisabled();
+    }
+    _bind(){
+      this.root.addEventListener('click', () => { if(!this.disabled) this.input.focus(); });
+      this.input.addEventListener('keydown', (e) => {
+        if (this.disabled) return;
+        if (e.key === 'Enter' || e.key === ','){
+          e.preventDefault();
+          const v = this.input.value.trim();
+          if (v) this.add(v);
+          this.input.value = '';
+        } else if (e.key === 'Backspace' && !this.input.value && this.tags.length){
+          this.remove(this.tags[this.tags.length-1]);
+        }
+      });
+    }
+    _refreshDisabled(){
+      this.input.disabled = this.disabled;
+      this.root.dataset.disabled = this.disabled ? 'true' : 'false';
+      this.root.classList.toggle('is-disabled', this.disabled);
+    }
+    setDisabled(flag){
+      this.disabled = !!flag;
+      this._refreshDisabled();
+    }
+    add(v){
+      if (!v) return;
+      const exists = this.tags.some(t => t.toLowerCase() === v.toLowerCase());
+      if (exists) return;
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = v;
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'tag-x';
+      x.innerHTML = '&times;';
+      x.addEventListener('click', () => this.remove(v));
+      tag.appendChild(x);
+      this.root.insertBefore(tag, this.input);
+      this.tags.push(v);
+    }
+    remove(v){
+      this.tags = this.tags.filter(t => t !== v);
+      [...this.root.querySelectorAll('.tag')].forEach(el => {
+        if (el.firstChild && el.firstChild.nodeType === Node.TEXT_NODE && el.firstChild.nodeValue === v){
+          el.remove();
+        }
+      });
+    }
+    set(values){
+      this.clear();
+      (values || []).forEach(v => this.add(v));
+    }
+    clear(){
+      this.tags = [];
+      [...this.root.querySelectorAll('.tag')].forEach(el => el.remove());
+    }
+    get(){
+      return [...this.tags];
+    }
+  }
+
+  const DEFAULT_SUGG = [
+    'context deadline exceeded','i/o timeout','timeout',
+    'connection refused','no such host','Temporary failure in name resolution',
+    'no endpoints available','ImagePullBackOff','ErrImagePull','manifest unknown','unauthorized',
+    'OOMKilled','Out of memory',
+    'readiness probe failed','liveness probe failed','startup probe failed',
+    'permission denied','forbidden','RBAC'
+  ];
+  function renderSuggestions(container, tagsInstance){
+    container.innerHTML = '';
+    DEFAULT_SUGG.forEach(s => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'sugg';
+      b.textContent = s;
+      b.addEventListener('click', () => tagsInstance.add(s));
+      container.appendChild(b);
+    });
+  }
+
+  function bindPatternMode(scope){
+    const segs = document.querySelectorAll(`.seg[data-scope="${scope}"]`);
+    const simple = document.querySelector(`.pattern-wrap[data-scope="${scope}"][data-mode="simple"]`);
+    const regex  = document.querySelector(`.pattern-wrap[data-scope="${scope}"][data-mode="regex"]`);
+    segs.forEach(btn => {
+      btn.addEventListener('click', () => {
+        segs.forEach(x => x.classList.remove('selected'));
+        btn.classList.add('selected');
+        const mode = btn.dataset.mode;
+        if (mode === 'simple'){
+          simple.hidden = false; regex.hidden = true;
+        } else {
+          simple.hidden = true; regex.hidden = false;
+        }
+      });
+    });
+  }
+
+  // ---------- Carregar detalhes do pod ----------
+  async function loadPod(ns, name) {
+    window.currentPodNamespace = ns;
+    window.currentPodName = name;
+
+    const uNs = encodeURIComponent(ns);
+    const uName = encodeURIComponent(name);
+    let r;
+    try {
+      r = await fetch(`/api/pod/${uNs}/${uName}`);
+    } catch (e) {
+      console.error("Network error while loading pod:", ns, name, e);
+      alert("Erro de rede ao carregar detalhes do pod. Veja o console.");
+      return;
+    }
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      console.error("API error:", r.status, r.statusText, txt);
+      alert(`Falha ao carregar pod ${name} em ${ns} (HTTP ${r.status}).`);
+      return;
+    }
+    const d = await r.json();
+    window._lastPodPayload = d; // mantemos para outras abas
+
+    document.getElementById('title').textContent = d.basic.name || '';
+    const phaseEl = document.getElementById('phase');
+    phaseEl.textContent = d.basic.phase || '';
+    phaseEl.className = 'badge ' + statusClass(d.basic.phase || '');
+    document.getElementById('ns').textContent = d.basic.namespace || '';
+
+    document.getElementById('pod_ip').textContent = d.basic.pod_ip || '';
+    document.getElementById('host_ip').textContent = d.basic.host_ip || '';
+    document.getElementById('node').textContent = d.basic.node_name || '';
+    document.getElementById('restarts').textContent = d.basic.restarts ?? 0;
+    document.getElementById('start_time').textContent = d.basic.start_time || '';
+
+    const cont = document.getElementById('containers'); cont.innerHTML = '';
+    (d.basic.containers || []).forEach(c => {
+      const li = document.createElement('li');
+      li.className = 'pill ' + (c.ready ? 'ok' : 'warn');
+      li.textContent = `${c.name}: ${c.state}${c.reason ? ' ('+c.reason+')' : ''}, ready=${c.ready}, restarts=${c.restarts}`;
+      cont.appendChild(li);
+    });
+
+    document.getElementById('logs').innerHTML = highlightText(d.logs || '');
+
+    const ev = document.getElementById('events'); ev.innerHTML = '';
+    (d.events || []).forEach(e => {
+      const li = document.createElement('li');
+      li.innerHTML = highlightText(e || '');
+      ev.appendChild(li);
+    });
+
+    document.getElementById('services').innerHTML = (d.services || []).map(s =>
+      `<li><strong>${s.name}</strong> (${s.type}) — ${s.cluster_ip || ''} ${s.ports.map(p=>`${p.port}${p.targetPort? '→'+p.targetPort:''}/${p.protocol}`).join(', ')}</li>`
+    ).join('');
+
+    document.getElementById('endpoints').innerHTML = (d.endpoints || []).map(e =>
+      `<li><strong>${e.service}</strong>: ${e.subsets.map(ss =>
+        `[${(ss.addresses||[]).map(a=>a.ip).join(', ') || '—'} ; notReady: ${(ss.not_ready||[]).map(a=>a.ip).join(', ') || '—'} ; ports: ${(ss.ports||[]).map(p=>p.port+(p.name?'('+p.name+')':'')).join(', ')}]`
+      ).join(' | ')}</li>`
+    ).join('');
+
+    document.getElementById('ingresses').innerHTML = (d.ingresses || []).map(ing =>
+      `<li><strong>${ing.name}</strong> — ${ing.rules.map(r =>
+        `${r.host || ''} ${r.paths.map(p => `${p.path} → ${p.service}:${p.port}`).join(', ')}`
+      ).join(' | ')}</li>`
+    ).join('');
+
+    document.getElementById('pvcs').innerHTML = (d.pvcs || []).map(x =>
+      `<li><strong>${x.claim}</strong> — ${x.status || ''} ${x.storage_class ? ' • sc='+x.storage_class : ''} ${x.capacity ? ' • cap='+x.capacity : ''} ${x.volume ? ' • pv='+x.volume : ''} ${x.pv_reclaim_policy ? ' • reclaim='+x.pv_reclaim_policy : ''}</li>`
+    ).join('');
+
+    // Soluções com Markdown
+    renderSolutionsCards(d.solutions || []);
+
+    const activeTab = document.querySelector('.tab.active')?.dataset?.tab;
+    if (activeTab === 'last-run') {
+      refreshLastRun();
+    }
+  }
+
+  // --------- Soluções (agora com Markdown) ----------
+  function renderSolutionsCards(solutions) {
+    const wrap = document.getElementById('solutions_wrap');
+    wrap.innerHTML = '';
+    if (!solutions || !solutions.length) {
+      wrap.innerHTML = '<div class="muted">Nenhum problema conhecido detectado nos logs/eventos.</div>';
+      return;
+    }
+
+    const list = (arr, code=false) => {
+      if (!arr || !arr.length) return '';
+      return '<ul>' + arr.map(x =>
+        `<li>${code ? `<code>${escapeHtml(x)}</code>` : highlightText(x)}</li>`
+      ).join('') + '</ul>';
+    };
+
+    solutions.forEach(s => {
+      const card = document.createElement('div');
+      card.className = 'fix-card';
+      card.dataset.sid = s.id || '';
+
+      const solutionHtml = markdownToHtml(s.solution || '', { withHighlight: true });
+      const metaChips = [
+        s.category ? `<span class="badge">${escapeHtml(s.category)}</span>` : '',
+        s.severity ? `<span class="badge">${escapeHtml(String(s.severity))}</span>` : ''
+      ].filter(Boolean).join(' ');
+
+      const diagHtml = (s.diagnostics && s.diagnostics.length)
+        ? `<h5>Diagnóstico sugerido</h5>${list(s.diagnostics, true)}`
+        : '';
+
+      const fixHtml = (s.fix_steps && s.fix_steps.length)
+        ? `<h5>Passos de correção</h5>${list(s.fix_steps)}`
+        : '';
+
+      const cmdsHtml = (s.k8s_commands && s.k8s_commands.length)
+        ? `<h5>Comandos úteis</h5>${list(s.k8s_commands, true)}`
+        : '';
+
+      const refsHtml = (s.references && s.references.length)
+        ? `<h5>Referências</h5>${list(s.references)}`
+        : '';
+
+      card.innerHTML = `
+        <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;">
+          <div class="fix-title">${escapeHtml(s.error || '')}</div>
+          <div>${metaChips}</div>
+          <button class="btn btn-sm btn-ghost" data-role="edit" title="Editar">Editar</button>
+        </div>
+
+        ${s.explanation ? `<div class="muted" style="margin:6px 0;">${highlightText(s.explanation)}</div>` : ''}
+
+        <div class="fix-desc prose">${solutionHtml}</div>
+
+        ${diagHtml}
+        ${fixHtml}
+        ${cmdsHtml}
+        ${refsHtml}
+
+        <div class="muted" style="font-size:12px; margin-top:6px;">
+          Fonte: <code>${escapeHtml(s.source || 'desconhecida')}</code>
+          • Padrão: <code>${escapeHtml(s.matched_by || '')}</code>
+        </div>
+      `;
+
+      card.querySelector('[data-role="edit"]').addEventListener('click', () => openEditDialog(s));
+      wrap.appendChild(card);
+    });
+  }
+  
+  function applyPlaceholdersClient(s){
+    if (s == null) return '';
+    const ns  = window.currentPodNamespace || '<ns>';
+    const pod = window.currentPodName || '<pod>';
+    return String(s).replaceAll('<ns>', ns).replaceAll('<pod>', pod);
+  }
+  
+  // --------- Chatbot (frontend) ----------
+  const chatMessagesEl = document.getElementById('chatMessages');
+  const chatInputEl = document.getElementById('chatInput');
+  const chatSendBtn = document.getElementById('chatSend');
+
+  function addChatMessage(role, text, { markdown = false } = {}) {
+    const div = document.createElement('div');
+    div.className = 'chat-msg role-' + role;
+  
+    const bubble = document.createElement('div');
+    bubble.className = 'chat-bubble';
+  
+    if (role === 'assistant' || markdown) {
+      bubble.innerHTML = markdownToHtml(text || '', { withHighlight: true });
+    } else {
+      bubble.textContent = text || '';
+    }
+  
+    div.appendChild(bubble);
+    chatMessagesEl.appendChild(div);
+  
+    // ⬇️ comportamento de scroll:
+    // - para o ASSISTENTE: manter o viewport no INÍCIO da nova resposta
+    // - para o USUÁRIO: seguir rolando pro final como antes
+    requestAnimationFrame(() => {
+      if (role === 'assistant') {
+        // tenta alinhar o topo da nova mensagem ao topo do container
+        try {
+          div.scrollIntoView({ block: 'start', behavior: 'auto' });
+        } catch (_) { /* fallback abaixo cobre */ }
+        // fallback / ajuste fino
+        const y = Math.max(div.offsetTop - 4, 0);
+        chatMessagesEl.scrollTop = y;
+      } else {
+        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+      }
+    });
+  }
+  
+
+  async function sendChat(){
+    const q = (chatInputEl.value || '').trim();
+    if (!q) return;
+  
+    addChatMessage('user', q);
+    chatInputEl.value = '';
+  
+    const payload = { question: q };
+    // apenas substituição de <ns>/<pod>, sem enviar logs/eventos
+    if (window.currentPodNamespace && window.currentPodName) {
+      payload.ns = window.currentPodNamespace;
+      payload.pod = window.currentPodName;
+    }
+  
+    try {
+      const r = await fetch('/api/chatbot/ask', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+  
+      if (!r.ok){
+        const t = await r.text().catch(()=> '');
+        addChatMessage('assistant', `Falha (HTTP ${r.status}). ${t}`);
+        return;
+      }
+  
+      const data = await r.json();
+  
+      const partsMd = [];
+  
+      // Mostra a resposta "final_answer" do backend primeiro, se existir
+      if (data.final_answer && data.final_answer.trim()){
+        partsMd.push(applyPlaceholdersClient(data.final_answer.trim()));
+      }
+  
+      if (data.matches && data.matches.length){
+        data.matches.forEach((m, i) => {
+          const scoreTxt = (m.score !== undefined) ? ` *(score ${m.score.toFixed(2)})*` : '';
+          const headMd   = `### ${i+1}. ${applyPlaceholdersClient(m.error || '')}${scoreTxt}`;
+          const solMd    = applyPlaceholdersClient(m.solution || '');
+          const docMd    = m.doc ? applyPlaceholdersClient(m.doc) : '';
+          const fonteMd  = m.source ? `\nFonte: \`${m.source}\` • Padrão: \`${m.matched_by || '—'}\`` : '';
+  
+          partsMd.push(
+  `${headMd}
+  
+  ${solMd}
+  
+  ${docMd ? `**Doc:**\n\n${docMd}\n` : ''}${fonteMd}`
+          );
+        });
+      } else if (!data.final_answer) {
+        partsMd.push('Não encontrei uma resposta no dataset do chatbot para sua pergunta.');
+      }
+  
+      if (data.tags && data.tags.length){
+        partsMd.push(`\n_Tags:_ ${data.tags.join(', ')}`);
+      }
+  
+      // Renderiza como Markdown
+      addChatMessage('assistant', partsMd.join('\n\n---\n\n'), { markdown: true });
+  
+    } catch (err) {
+      addChatMessage('assistant', 'Erro: ' + err);
+    }
+  }
+  
+
+  chatSendBtn.addEventListener('click', sendChat);
+  chatInputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey){
+      e.preventDefault();
+      sendChat();
+    }
+  });
+
+  // --------- Diálogo: Editar solução ----------
+  const dlgEdit = document.getElementById('dlgEdit');
+  const dlgEdit_sid = document.getElementById('dlgEdit_sid');
+  const dlgEdit_error = document.getElementById('dlgEdit_error');
+  const dlgEdit_patterns = document.getElementById('dlgEdit_patterns');
+  const dlgEdit_unlock_patterns = document.getElementById('dlgEdit_unlock_patterns');
+  const dlgEdit_solution = document.getElementById('dlgEdit_solution');
+  const dlgEdit_msg = document.getElementById('dlgEdit_msg');
+  const dlgEdit_save = document.getElementById('dlgEdit_save');
+  const dlgEdit_expand = document.getElementById('dlgEdit_expand');
+  const dlgEdit_test = document.getElementById('dlgEdit_test');
+  const dlgEdit_test_btn = document.getElementById('dlgEdit_test_btn');
+  const dlgEdit_test_out = document.getElementById('dlgEdit_test_out');
+  const dlgEdit_suggestions = document.getElementById('dlgEdit_suggestions');
+  let editTags;
+
+  dlgEdit_unlock_patterns.addEventListener('change', () => {
+    const can = dlgEdit_unlock_patterns.checked;
+    editTags?.setDisabled(!can);
+    dlgEdit_patterns.disabled = !can;
+    document.querySelectorAll('.pattern-wrap[data-scope="edit"]').forEach(w => {
+      w.classList.toggle('locked', !can);
+    });
+  });
+
+  function splitPatternsIntoSimpleAndRegex(patterns){
+    const simple=[], regex=[];
+    (patterns||[]).forEach(p=>{
+      const s = String(p||'').trim();
+      if (!s) return;
+      if (s.startsWith('re:')) regex.push(s.slice(3));
+      else simple.push(s);
+    });
+    return {simple, regex};
+  }
+  function composePatternsFromUI(scope){
+    const tags = scope==='new' ? newTags.get() : editTags.get();
+    const rxArea = scope==='new' ? document.getElementById('dlgNew_patterns') : dlgEdit_patterns;
+    const regexLines = (rxArea.value||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean).map(s => s.startsWith('re:')? s : 're:' + s);
+    return [...tags, ...regexLines];
+  }
+
+  function runTestAgainstSample(scope){
+    const area = scope==='new' ? document.getElementById('dlgNew_test') : dlgEdit_test;
+    const out  = scope==='new' ? document.getElementById('dlgNew_test_out') : dlgEdit_test_out;
+    const text = area.value || '';
+    const pats = composePatternsFromUI(scope);
+    if (!text.trim()){ out.textContent='Cole acima algumas linhas de log/erro.'; return; }
+    if (!pats.length){ out.textContent='Adicione ao menos uma palavra-chave ou regex.'; return; }
+
+    const lines = text.split(/\r?\n/).filter(Boolean);
+    let hits = 0;
+    try{
+      const regs = pats.map(p=>{
+        if (p.startsWith('re:')) return new RegExp(p.slice(3), 'i');
+        return new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      });
+      for (const ln of lines){
+        if (regs.some(rx => rx.test(ln))) hits++;
+      }
+      out.textContent = `Padrões: ${pats.length} • Linhas testadas: ${lines.length} • Linhas que bateram: ${hits}`;
+    }catch(e){
+      out.textContent = 'Erro na regex: ' + e;
+    }
+  }
+
+  function openEditDialog(s) {
+    dlgEdit_sid.value = s.id || '';
+    dlgEdit_error.value = s.error || '';
+
+    const {simple, regex} = splitPatternsIntoSimpleAndRegex(s.patterns || []);
+    dlgEdit_patterns.value = (regex||[]).join('\n');
+
+    const root = document.getElementById('dlgEdit_tags');
+    root.innerHTML = '';
+    editTags = new TagsInput(root, {placeholder:'Digite e Enter…', disabled:true});
+    editTags.set(simple);
+
+    renderSuggestions(dlgEdit_suggestions, editTags);
+
+    dlgEdit_unlock_patterns.checked = false;
+    editTags.setDisabled(true);
+    dlgEdit_patterns.disabled = true;
+    document.querySelectorAll('.pattern-wrap[data-scope="edit"]').forEach(w => w.classList.add('locked'));
+
+    bindPatternMode('edit');
+    dlgEdit_test_btn.onclick = () => runTestAgainstSample('edit');
+
+    dlgEdit_solution.value = s.solution || '';
+    dlgEdit_msg.textContent = '';
+
+    bindAutosize(dlgEdit_solution);
+    requestAnimationFrame(() => autosize(dlgEdit_solution));
+    bindFullscreen(dlgEdit, dlgEdit_expand);
+    bindSaveOnShortcut(dlgEdit_solution, dlgEdit_save);
+
+    dlgEdit.showModal();
+  }
+
+  dlgEdit_save.addEventListener('click', async (e) => {
+    e.preventDefault();
+    const sid = dlgEdit_sid.value;
+    if (!sid) { dlgEdit_msg.textContent = 'ID ausente.'; return; }
+    const payload = {
+      error: dlgEdit_error.value || '',
+      solution: dlgEdit_solution.value || '',
+      patterns: composePatternsFromUI('edit')
+    };
+    dlgEdit_msg.textContent = 'Salvando...';
+    try {
+      const r = await fetch(`/api/dataset/solutions/${encodeURIComponent(sid)}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) {
+        const t = await r.text().catch(()=> '');
+        dlgEdit_msg.textContent = `Falha ao salvar (HTTP ${r.status}). ${t}`;
+        return;
+      }
+      dlgEdit.close();
+      if (window.currentPodNamespace && window.currentPodName) {
+        loadPod(window.currentPodNamespace, window.currentPodName);
+      }
+    } catch (err) {
+      dlgEdit_msg.textContent = 'Erro: ' + err;
+    }
+  });
+
+  // --------- Diálogo: Nova solução ----------
+  const btnNewSolution = document.getElementById('btnNewSolution');
+  const dlgNew = document.getElementById('dlgNew');
+  const dlgNew_error = document.getElementById('dlgNew_error');
+  const dlgNew_patterns = document.getElementById('dlgNew_patterns');
+  const dlgNew_solution = document.getElementById('dlgNew_solution');
+  const dlgNew_msg = document.getElementById('dlgNew_msg');
+  const dlgNew_save = document.getElementById('dlgNew_save');
+  const dlgNew_expand = document.getElementById('dlgNew_expand');
+  const dlgNew_test = document.getElementById('dlgNew_test');
+  const dlgNew_test_btn = document.getElementById('dlgNew_test_btn');
+  const dlgNew_test_out = document.getElementById('dlgNew_test_out');
+  const dlgNew_suggestions = document.getElementById('dlgNew_suggestions');
+  let newTags;
+
+  btnNewSolution.addEventListener('click', () => {
+    dlgNew_error.value = '';
+    dlgNew_patterns.value = '';
+    dlgNew_solution.value = '';
+    dlgNew_msg.textContent = '';
+
+    const root = document.getElementById('dlgNew_tags');
+    root.innerHTML = '';
+    newTags = new TagsInput(root, {placeholder:'Digite e Enter…'});
+    renderSuggestions(dlgNew_suggestions, newTags);
+
+    bindPatternMode('new');
+    dlgNew_test_btn.onclick = () => runTestAgainstSample('new');
+
+    bindAutosize(dlgNew_solution);
+    requestAnimationFrame(() => autosize(dlgNew_solution));
+    bindFullscreen(dlgNew, dlgNew_expand);
+    bindSaveOnShortcut(dlgNew_solution, dlgNew_save);
+
+    dlgNew.showModal();
+  });
+
+  dlgNew_save.addEventListener('click', async (e) => {
+    e.preventDefault();
+    const errorTxt = (dlgNew_error.value || '').trim();
+    const solTxt = (dlgNew_solution.value || '').trim();
+    if (!errorTxt || !solTxt) {
+      dlgNew_msg.textContent = "Preencha 'Erro' e 'Solução'.";
+      return;
+    }
+    const patterns = composePatternsFromUI('new');
+    if (!patterns.length){
+      dlgNew_msg.textContent = "Adicione ao menos uma palavra-chave ou regex em 'Identificação do erro'.";
+      return;
+    }
+    dlgNew_msg.textContent = 'Salvando...';
+    try {
+      const r = await fetch('/api/dataset/solutions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ error: errorTxt, solution: solTxt, patterns })
+      });
+      if (!r.ok) {
+        const t = await r.text().catch(()=> '');
+        dlgNew_msg.textContent = `Falha (HTTP ${r.status}). ${t}`;
+        return;
+      }
+      dlgNew.close();
+      if (window.currentPodNamespace && window.currentPodName) {
+        loadPod(window.currentPodNamespace, window.currentPodName);
+      }
+    } catch (err) {
+      dlgNew_msg.textContent = 'Erro: ' + err;
+    }
+  });
+
+  // ---------- Última Execução ----------
+  const lastRunMetaEl = document.getElementById('lastRunMeta');
+  const lastRunContainersEl = document.getElementById('lastRunContainers');
+  const lastRunEventsEl = document.getElementById('lastRunEvents');
+  const btnLastRunRefresh = document.getElementById('btnLastRunRefresh');
+  const btnLastRunSnapshot = document.getElementById('btnLastRunSnapshot');
+  const snapshotBlock = document.getElementById('snapshotBlock');
+  const snapshotContent = document.getElementById('snapshotContent');
+
+  btnLastRunRefresh.addEventListener('click', () => {
+    if (!window.currentPodNamespace || !window.currentPodName) {
+      alert('Selecione um pod primeiro.');
+      return;
+    }
+    refreshLastRun();
+  });
+
+  btnLastRunSnapshot.addEventListener('click', async () => {
+    if (!window.currentPodNamespace || !window.currentPodName) {
+      alert('Selecione um pod primeiro.');
+      return;
+    }
+    await openLastRunSnapshot(window.currentPodNamespace, window.currentPodName);
+  });
+
+  async function refreshLastRun(){
+    const ns = window.currentPodNamespace;
+    const pod = window.currentPodName;
+    if (!ns || !pod) return;
+
+    lastRunMetaEl.textContent = 'Carregando…';
+    lastRunContainersEl.innerHTML = '';
+    lastRunEventsEl.innerHTML = '';
+    snapshotBlock.style.display = 'none';
+    snapshotContent.innerHTML = '';
+    btnLastRunSnapshot.disabled = true;
+
+    const uNs = encodeURIComponent(ns);
+    const uName = encodeURIComponent(pod);
+    try{
+      const r = await fetch(`/api/pod/${uNs}/${uName}/last-run`);
+      if (!r.ok){
+        lastRunMetaEl.textContent = `Falha (HTTP ${r.status})`;
+        return;
+      }
+      const data = await r.json();
+      const live = data.live || {};
+      const hasSnap = !!data.snapshot_available;
+      const meta = data.snapshot_meta || null;
+
+      lastRunMetaEl.textContent = `Última finalização (agregada): ${live.last_finished_at || '—'}`
+        + (hasSnap ? ` • snapshot salvo em: ${meta?.saved_at || '—'} • last_finished_at(snapshot): ${meta?.last_finished_at || '—'}` : '');
+
+      const containers = live.containers || [];
+      if (!containers.length){
+        lastRunContainersEl.innerHTML = '<div class="muted">Sem dados de última execução.</div>';
+      } else {
+        lastRunContainersEl.innerHTML = containers.map(c => `
+          <div class="cluster-card">
+            <div><strong>Container:</strong> ${c.name} ${c.is_init ? '(init)' : ''}</div>
+            <div class="muted" style="font-size:12px;">Restarts: ${c.restart_count ?? 0} • Terminated: ${c.terminated ? 'sim' : 'não'} • Motivo: ${c.last_reason || '—'} • ExitCode: ${c.last_exit_code ?? '—'} • Finalizado em: ${c.finished_at || '—'}</div>
+            <details style="margin-top:6px;">
+              <summary>Logs da última execução</summary>
+              <pre class="code" style="white-space:pre-wrap;max-height:320px;overflow:auto;">${highlightText(c.logs || '')}</pre>
+            </details>
+          </div>
+        `).join('');
+      }
+
+      const evs = live.events || [];
+      if (!evs.length){
+        lastRunEventsEl.innerHTML = '<li class="muted">Sem eventos.</li>';
+      } else {
+        lastRunEventsEl.innerHTML = evs.slice(0, 80).map(e => `<li>${highlightText(e || '')}</li>`).join('');
+      }
+
+      if (hasSnap){
+        btnLastRunSnapshot.disabled = false;
+      }
+    }catch(err){
+      lastRunMetaEl.textContent = 'Erro: ' + err;
+    }
+  }
+
+  async function openLastRunSnapshot(ns, pod){
+    const uNs = encodeURIComponent(ns);
+    const uName = encodeURIComponent(pod);
+    snapshotBlock.style.display = 'block';
+    snapshotContent.innerHTML = '<div class="muted">Carregando snapshot salvo…</div>';
+    try{
+      const r = await fetch(`/api/pod/${uNs}/${uName}/last-run/snapshot`);
+      if (!r.ok){
+        snapshotContent.innerHTML = `<div class="muted">Falha ao carregar snapshot (HTTP ${r.status}).</div>`;
+        return;
+      }
+      const s = await r.json();
+      const containers = s.containers || [];
+      const events = s.events || [];
+
+      const contHtml = containers.map(c => `
+        <div class="cluster-card">
+          <div><strong>Container:</strong> ${c.name} ${c.is_init ? '(init)' : ''}</div>
+          <div class="muted" style="font-size:12px;">ExitCode: ${c.last_exit_code ?? '—'} • Motivo: ${c.last_reason || '—'} • Finalizado em: ${c.finished_at || '—'}</div>
+          <details style="margin-top:6px;">
+            <summary>Logs (snapshot)</summary>
+            <pre class="code" style="white-space:pre-wrap;max-height:320px;overflow:auto;">${highlightText(c.logs || '')}</pre>
+          </details>
+        </div>
+      `).join('');
+
+      const evHtml = (events || []).slice(0, 120).map(e => `<li>${highlightText(e || '')}</li>`).join('');
+
+      snapshotContent.innerHTML = `
+        <div class="muted" style="font-size:12px;">Snapshot salvo em: ${s.saved_at || '—'} • Pod phase: ${s.phase || '—'} • last_finished_at: ${s.last_finished_at || '—'}</div>
+        <h5 style="margin:8px 0 6px 0;">Containers (snapshot)</h5>
+        ${contHtml || '<div class="muted">Sem dados de containers no snapshot.</div>'}
+        <h5 style="margin:8px 0 6px 0;">Eventos (snapshot)</h5>
+        <ul class="events">${evHtml || '<li class="muted">Sem eventos no snapshot.</li>'}</ul>
+      `;
+    }catch(err){
+      snapshotContent.innerHTML = `<div class="muted">Erro ao abrir snapshot: ${err}</div>`;
+    }
+  }
+</script>
+</body>
+</html>

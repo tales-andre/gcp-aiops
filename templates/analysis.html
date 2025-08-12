@@ -1,0 +1,869 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>Análise ML – K8s Pod Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
+
+  <!-- Chart.js + Zoom (defer p/ baixar em paralelo) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js" defer></script>
+
+  <script>
+    // Desativa animações globais para render mais rápido
+    window.addEventListener('DOMContentLoaded', () => {
+      try {
+        if (window.Chart) {
+          Chart.defaults.animation = false;
+          Chart.defaults.responsiveAnimationDuration = 0;
+          Chart.defaults.font.family = 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial';
+        }
+      } catch(e){}
+    });
+
+    // Registro defensivo do plugin (segue ok se não carregar)
+    window.addEventListener('load', () => {
+      try {
+        const ZoomPlugin =
+          window['chartjs-plugin-zoom'] ||
+          window.ChartZoom ||
+          (window.Chart && window.Chart.Zoom);
+        if (ZoomPlugin && window.Chart && window.Chart.register) {
+          window.Chart.register(ZoomPlugin);
+        }
+      } catch(e) {
+        console.warn('zoom plugin não registrado:', e);
+      }
+    });
+  </script>
+</head>
+<body class="page-analysis">
+<header class="appbar">
+  <div class="brand">
+    <div class="logo">⎈</div>
+    <div class="title">Análise ML</div>
+  </div>
+  <div class="help">
+    <a class="link" href="{{ url_for('dashboard') }}">← Voltar ao Dashboard</a>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="search">
+      <label class="muted" for="ns">Namespaces (opcional, separados por vírgula)</label>
+      <input id="ns" placeholder="ex.: testing,testing2" />
+    </div>
+
+    <div class="row" style="gap:10px;">
+      <div class="search" style="flex:1;">
+        <label class="muted" for="limit_pods">Qtd. máx. de pods</label>
+        <input id="limit_pods" type="number" value="120" min="5" max="500"/>
+      </div>
+      <div class="search" style="flex:1;">
+        <label class="muted" for="tail">Linhas de log por contêiner</label>
+        <input id="tail" type="number" value="600" min="50" max="2000"/>
+      </div>
+    </div>
+
+    <div class="row" style="gap:10px;">
+      <div class="search" style="flex:1;">
+        <label class="muted" for="k">Clusters (k) — vazio = auto</label>
+        <input id="k" type="number" min="1" max="20" placeholder="auto"/>
+      </div>
+      <div class="search" style="flex:1;">
+        <label class="muted" for="svd">Redução SVD</label>
+        <select id="svd">
+          <option value="1" selected>Ativar (recomendado)</option>
+          <option value="0">Desativar</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- NOVO: limites para agrupamento do backend -->
+    <div class="row" style="gap:10px;">
+      <div class="search" style="flex:1;">
+        <label class="muted" for="item_limit">Máx. ocorrências por entidade</label>
+        <input id="item_limit" type="number" value="120" min="0" max="1000"/>
+        <div class="small muted">0 = sem limite (pode ficar pesado)</div>
+      </div>
+      <div class="search" style="flex:1;">
+        <label class="muted" for="per_pod_limit">Máx. ocorrências por pod</label>
+        <input id="per_pod_limit" type="number" value="6" min="0" max="50"/>
+        <div class="small muted">Balanceia amostra entre pods</div>
+      </div>
+    </div>
+
+    <div class="row" style="gap:10px;">
+      <button id="run" class="btn" title="Recalcular clusters 2D">Clusters 2D</button>
+      <button id="refreshAll" class="btn" title="Recarregar erros comuns">Erros comuns</button>
+      <button id="applyDetail" class="btn" title="Aplicar limites no detalhe">Aplicar detalhe</button>
+    </div>
+
+    <div class="search">
+      <div id="summary" class="muted small"></div>
+    </div>
+  </aside>
+
+  <main class="content">
+    <!-- BLOCO 1: Erros comuns -->
+    <section class="panel">
+      <h3 style="margin:0 0 8px 0;">Erros comuns</h3>
+      <div id="kpis" class="kpi-grid" style="margin-bottom:10px;"></div>
+
+      <div class="charts-grid">
+        <div class="chart-card">
+          <h3>Distribuição por tipo</h3>
+          <div class="chart-area"><canvas id="chartTypes" aria-label="Distribuição por tipo"></canvas></div>
+          <div id="legendTypes" class="legend"></div>
+          <div class="muted small" id="hintClickType" style="margin-top:6px;">Clique no gráfico (ou no card) para filtrar o detalhe e subclusters do tipo.</div>
+        </div>
+        <div class="chart-card">
+          <h3>Top pods (geral)</h3>
+          <div class="chart-area"><canvas id="chartTopPods" aria-label="Top pods"></canvas></div>
+          <div class="muted small">Clique em um pod para abrir o detalhe rápido.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- BLOCO 2: Detalhe -->
+    <section class="panel" style="margin-top:16px;">
+      <div class="row" style="justify-content:space-between; gap:12px;">
+        <h3 id="detailTitle" style="margin:0;">Detalhe • <span class="muted">selecione um tipo de erro…</span></h3>
+        <div class="row">
+          <span class="muted small">Tipo selecionado:</span>
+          <span id="selectedTypeChip" class="chip">—</span>
+          <button id="btnClearType" class="btn" title="Limpar tipo" style="margin-left:8px;">Limpar</button>
+        </div>
+      </div>
+
+      <div class="tabs" id="detailTabs" style="margin-top:8px;">
+        <div class="tab active" data-tab="by-entity">Por entidade</div>
+        <div class="tab" data-tab="all-pods">Todos os pods</div>
+        <div class="tab" data-tab="examples">Exemplos de linhas</div>
+      </div>
+
+      <div id="panel-by-entity">
+        <div id="entitiesWrap" class="empty">Selecione um tipo de erro para ver as entidades e pods relacionados.</div>
+      </div>
+      <div id="panel-all-pods" style="display:none;">
+        <div id="podsWrap" class="empty">Sem dados.</div>
+      </div>
+      <div id="panel-examples" style="display:none;">
+        <ul id="examplesWrap" class="empty" style="padding-left:18px;"></ul>
+      </div>
+    </section>
+
+    <!-- BLOCO 3: Subclusters / clusters -->
+    <section class="panel" style="margin-top:16px;">
+      <div class="row" style="justify-content:space-between; gap:12px; align-items:flex-end;">
+        <h3 id="clusterBlockTitle" style="margin:0 0 8px 0;">Clusters (dinâmico)</h3>
+        <div class="row" style="gap:10px;">
+          <label class="small"><input type="checkbox" id="cbShowOutliers" checked> Mostrar outliers</label>
+          <label class="small">Tamanho do ponto:
+            <input type="range" id="pointSize" min="2" max="10" step="1" value="4" style="vertical-align:middle;">
+          </label>
+          <button id="btnResetZoom" class="btn" style="padding:8px 10px;">Resetar zoom</button>
+          <button id="btnReloadCluster" class="btn" style="padding:8px 10px;">Recarregar clusters</button>
+        </div>
+      </div>
+
+      <div class="chart-card" style="margin-top:10px;">
+        <div class="chart-area" style="height:420px;">
+          <canvas id="chartCluster2D" aria-label="Projeção 2D dos clusters"></canvas>
+        </div>
+        <div id="legendClusters" class="legend" style="margin-top:8px;"></div>
+        <div class="muted small" id="clusterSummary" style="margin-top:6px;">—</div>
+      </div>
+
+      <div class="chart-card" style="margin-top:14px;">
+        <h3 id="stackedTitle" style="margin:0 0 8px 0;">Erros por cluster (stack)</h3>
+        <div class="chart-area" style="height:260px;">
+          <canvas id="chartErrorsByCluster" aria-label="Erros por cluster"></canvas>
+        </div>
+        <div class="muted small">Clique em uma barra para focar o cluster no gráfico 2D e ver os pods.</div>
+      </div>
+
+      <div class="panel" id="clusterInfo" style="margin-top:12px;">
+        <h3 style="margin:0 0 6px 0;">Cluster selecionado • <span id="clusterInfoTitle" class="muted">nenhum</span></h3>
+        <div id="clusterInfoBody" class="empty">Clique em um cluster (legenda, ponto ou barra) para ver detalhes.</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Painel lateral -->
+<div id="sidepanel" class="sidepanel" aria-hidden="true">
+  <div class="sp-head">
+    <div>
+      <div id="spTitle"><strong>Pod</strong></div>
+      <div id="spNs" class="small"></div>
+    </div>
+    <button class="btn" id="spClose">Fechar</button>
+  </div>
+  <div class="sp-body">
+    <div class="row" style="gap:12px; flex-wrap:wrap;">
+      <span class="pill" id="spPhase">—</span>
+      <span class="pill" id="spRestarts">—</span>
+      <span class="pill" id="spNode">—</span>
+    </div>
+    <div class="small muted" id="spMeta" style="margin-top:8px;"></div>
+    <h4 style="margin:12px 0 6px 0;">Logs (amostra)</h4>
+    <pre class="code" id="spLogs">Carregando…</pre>
+  </div>
+</div>
+
+<script>
+  // ---------- Persistência simples de preferências ----------
+  const PREF_KEYS = ['ns','limit_pods','tail','k','svd','item_limit','per_pod_limit','cbShowOutliers','pointSize'];
+  function loadPrefs(){
+    try {
+      PREF_KEYS.forEach(k=>{
+        const v = localStorage.getItem('analysis:'+k);
+        if (v == null) return;
+        const el = document.getElementById(k) || document.querySelector(`[name="${k}"]`);
+        if (!el) return;
+        if (el.type === 'checkbox') el.checked = (v === 'true');
+        else el.value = v;
+      });
+    } catch(e){}
+  }
+  function savePref(id, val){
+    try { localStorage.setItem('analysis:'+id, String(val)); } catch(e){}
+  }
+
+  // ---------- DOM refs ----------
+  const nsEl = document.getElementById('ns');
+  const limitEl = document.getElementById('limit_pods');
+  const tailEl = document.getElementById('tail');
+  const kEl = document.getElementById('k');
+  const svdEl = document.getElementById('svd');
+  const itemLimitEl = document.getElementById('item_limit');
+  const perPodLimitEl = document.getElementById('per_pod_limit');
+
+  const runBtn = document.getElementById('run');
+  const refreshAllBtn = document.getElementById('refreshAll');
+  const applyDetailBtn = document.getElementById('applyDetail');
+
+  const kpisEl = document.getElementById('kpis');
+  const chartTypesEl = document.getElementById('chartTypes');
+  const legendTypesEl = document.getElementById('legendTypes');
+  const chartTopPodsEl = document.getElementById('chartTopPods');
+
+  const detailTitleEl = document.getElementById('detailTitle');
+  const selectedTypeChip = document.getElementById('selectedTypeChip');
+  const entitiesWrap = document.getElementById('entitiesWrap');
+  const podsWrap = document.getElementById('podsWrap');
+  const examplesWrap = document.getElementById('examplesWrap');
+  const btnClearType = document.getElementById('btnClearType');
+
+  const tabsEl = document.getElementById('detailTabs');
+  const panelByEntity = document.getElementById('panel-by-entity');
+  const panelAllPods = document.getElementById('panel-all-pods');
+  const panelExamples = document.getElementById('panel-examples');
+
+  // Quick view
+  const sp = {
+    el: document.getElementById('sidepanel'),
+    closeBtn: document.getElementById('spClose'),
+    title: document.getElementById('spTitle'),
+    ns: document.getElementById('spNs'),
+    phase: document.getElementById('spPhase'),
+    restarts: document.getElementById('spRestarts'),
+    node: document.getElementById('spNode'),
+    meta: document.getElementById('spMeta'),
+    logs: document.getElementById('spLogs'),
+  };
+
+  let selectedType = null;
+  let cachedErrorsByType = null;
+  let cachedSummary = null;
+  let cachedGroups = null;
+
+  // ---------- Utils ----------
+  function makeParams(includeDetailLimits=false){
+    const params = new URLSearchParams();
+    if (nsEl.value.trim()) params.set('ns', nsEl.value.trim());
+    params.set('limit_pods', limitEl.value || '120');
+    params.set('tail', tailEl.value || '600');
+    if (includeDetailLimits){
+      const il = parseInt(itemLimitEl.value || '0', 10);
+      const ppl = parseInt(perPodLimitEl.value || '0', 10);
+      params.set('item_limit', isNaN(il) ? '0' : String(il));
+      params.set('per_pod_limit', isNaN(ppl) ? '0' : String(ppl));
+    }
+    return params;
+  }
+  const palette = ['#6aa9ff', '#ff7aa2', '#ffd166', '#4dd0e1', '#a78bfa', '#80e27e', '#f28b82', '#fbbc04', '#34a853', '#a0aec0'];
+
+  function iconForEntity(entity){
+    if (!entity) return '';
+    if (entity.startsWith('service:')) return '🧩';
+    if (entity.startsWith('ip:')) return '🖧';
+    if (entity.startsWith('host:')) return '🌐';
+    if (entity.startsWith('rbac:') || entity.startsWith('path:')) return '🔐';
+    return '❓';
+  }
+  function causeBadge(cause){
+    if (!cause) return '';
+    const map = {
+      'no_endpoints': 'sem Endpoints',
+      'pods_unhealthy': 'pods de destino não prontos',
+      'pod_down': 'destino inativo',
+      'unknown': 'causa desconhecida'
+    };
+    const txt = map[cause] || cause;
+    return `<span class="pill warn">${txt}</span>`;
+  }
+  function podLink(ns, pod){ return `<button class="btn" data-open-pod="${ns}|${pod}">Ver detalhes</button>`; }
+
+  function escapeHtml(s){
+    return (s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  const paletteCrit = [
+    /\berror\b/gi, /\berro\b/gi, /\bfailed\b/gi, /\bfail\b/gi,
+    /\bexception\b/gi, /\bpanic\b/gi, /\bdenied\b/gi,
+    /\bunauthorized\b/gi, /\bforbidden\b/gi, /\boomkilled\b/gi,
+    /\bout of memory\b/gi, /\bcrash(loop|ed|ing)?\b/gi,
+    /\btimeout\b/gi, /\bcontext deadline exceeded\b/gi,
+    /\bno such host\b/gi, /\bcould not resolve host\b/gi, /\btemporary failure in name resolution\b/gi
+  ];
+  const paletteWarn = [/\bwarn(ing)?\b/gi, /\bdeprecat(ed|ion)\b/gi, /\bretry(ing)?\b/gi, /\bback[- ]?off\b/gi, /\bslow\b/gi];
+  function highlightText(raw){
+    let html = escapeHtml(raw || "");
+    paletteCrit.forEach(rx => { html = html.replace(rx, m => `<span class="hl crit">${m}</span>`); });
+    paletteWarn.forEach(rx => { html = html.replace(rx, m => `<span class="hl warn">${m}</span>`); });
+    return html;
+  }
+
+  // ---------- Charts ----------
+  let chartTypes, chartTopPods;
+  function makeDonut(ctx, labels, data){
+    chartTypes?.destroy?.();
+    chartTypes = new Chart(ctx, {
+      type: 'doughnut',
+      data: { labels, datasets: [{ data, backgroundColor: labels.map((_,i)=>palette[i%palette.length]) }] },
+      options: {
+        responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{ display:false }, tooltip:{ enabled:true } },
+        onClick: (evt, els)=>{ if (els?.length){ setSelectedType(labels[els[0].index]); } }
+      }
+    });
+    legendTypesEl.innerHTML = labels.map((lb, i) =>
+      `<span class="lg-item" role="button" tabindex="0" data-type="${lb}">
+         <span class="lg-dot" style="background:${palette[i%palette.length]}"></span>${lb}
+       </span>`
+    ).join('');
+    legendTypesEl.querySelectorAll('[data-type]').forEach(el => {
+      el.addEventListener('click', ()=> setSelectedType(el.dataset.type));
+      el.addEventListener('keypress', (e)=>{ if (e.key==='Enter') setSelectedType(el.dataset.type); });
+    });
+  }
+  function makeBarH(ctx, labels, data, onBarClick){
+    chartTopPods?.destroy?.();
+    chartTopPods = new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: 'Ocorrências', data, backgroundColor: labels.map((_,i)=>palette[i%palette.length]) }] },
+      options: {
+        indexAxis:'y', responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{ display:false }, tooltip:{ enabled:true } },
+        onClick: (evt, els)=>{ if (els?.length){ const i = els[0].index; onBarClick && onBarClick(i, labels[i]); } },
+        scales:{ y:{ ticks:{ autoSkip:false } } }
+      }
+    });
+  }
+
+  // ---------- Dados comuns ----------
+  async function loadErrorsCommon({nocache=false} = {}){
+    const params = makeParams();
+    if (nocache) params.set('nocache','1');
+
+    const [rTypes, rSummary] = await Promise.allSettled([
+      fetch('/api/ml/errors-by-type?' + params.toString()),
+      fetch('/api/ml/summary?' + params.toString()),
+    ]);
+
+    cachedErrorsByType = (rTypes.status === 'fulfilled' && rTypes.value.ok) ? await rTypes.value.json() : { types:{} };
+    cachedSummary     = (rSummary.status === 'fulfilled' && rSummary.value.ok) ? await rSummary.value.json() : { types:{}, top_pods:[] };
+
+    const entries = Object.entries(cachedErrorsByType.types || {}).sort((a,b)=>b[1].total - a[1].total);
+    kpisEl.innerHTML = entries.slice(0,10).map(([t,info])=>`
+      <div class="kpi ${selectedType===t?'active':''}" data-type="${t}">
+        <div class="label">${t}</div>
+        <div class="value">${info.total}</div>
+        <div class="small muted">${Object.keys(info.pods||{}).length} pod(s)</div>
+      </div>`).join('') || `<div class="empty">Sem dados.</div>`;
+    [...document.querySelectorAll('.kpi')].forEach(el=> el.addEventListener('click', ()=> setSelectedType(el.dataset.type)));
+
+    const typeLabels = entries.map(([t])=>t);
+    const typeCounts = entries.map(([,obj])=> obj.total || 0);
+    makeDonut(chartTypesEl, typeLabels, typeCounts);
+
+    const topPairs = (cachedSummary.top_pods || []).slice(0, 20);
+    makeBarH(chartTopPodsEl, topPairs.map(([p])=>p), topPairs.map(([,c])=>c),
+      (i, label)=>{ const [ns,pod] = (label||'').split('/'); if (ns && pod) openPodQuickView(ns,pod); });
+
+    // Se nenhum tipo estiver selecionado, auto-seleciona o primeiro
+    if (!selectedType) setSelectedType(typeLabels[0] || null);
+  }
+
+  // ---------- Agrupamentos por entidade (com limites novos) ----------
+  async function ensureGroups(){
+    const params = makeParams(true);
+    if (selectedType) params.set('type', selectedType); // só para coerência de cache do frontend
+    const url = '/api/ml/errors?' + params.toString();
+    if (cachedGroups?.__url === url) return cachedGroups;
+
+    entitiesWrap.innerHTML = `<div class="muted small">Carregando entidades…</div>`;
+    const r = await fetch(url);
+    const d = r.ok ? await r.json() : { groups: [] };
+    d.__url = url;
+    cachedGroups = d;
+    return d;
+  }
+
+  // ---------- Detail Panels ----------
+  function podRow(ns, pod){
+    return `<tr><td style="width:38%;">${ns}</td><td style="width:42%;">${pod}</td><td style="width:20%;">${podLink(ns,pod)}</td></tr>`;
+  }
+
+  async function fillDetailPanels(t){
+    const info = cachedErrorsByType?.types?.[t];
+    const groups = (await ensureGroups()).groups || [];
+    const related = groups.filter(g => (g.type||'') === t);
+
+    if (!related.length){
+      entitiesWrap.innerHTML = `<div class="empty">Sem entidades para este tipo.</div>`;
+    } else {
+      entitiesWrap.innerHTML = related.slice(0, 60).map((g, idx)=>{
+        const podsList = (g.pods && g.pods.length)
+          ? g.pods.slice()
+          : Array.from(new Set((g.items||[]).map(it=>`${it.ns}/${it.pod}`)));
+        const pods = podsList.sort();
+        const podRows = pods.slice(0, 120).map(k=>{ const [ns,pod]=k.split('/'); return podRow(ns,pod); }).join('');
+
+        const tmplHtml = (g.templates || []).slice(0,8).map(([txt,c]) =>
+          `<li class="small"><code>${highlightText(txt)}</code> — ${c}</li>`
+        ).join('');
+
+        const enrich = g.enrichment || {};
+        const enrichLine = (enrich.description || enrich.cause) ? `
+          <div class="small" style="margin:6px 0;">
+            ${enrich.description ? `<span class="muted">${escapeHtml(enrich.description)}</span>` : ``}
+            ${enrich.cause ? ` ${causeBadge(enrich.cause)}` : ``}
+          </div>` : ``;
+
+        // Colapsável (melhora performance quando há muitas linhas)
+        const collapseId = `pods-${idx}`;
+        return `
+          <div class="entity-card">
+            <div class="entity-head">
+              <div class="entity-title">${iconForEntity(g.entity)} ${escapeHtml(g.entity.replace(/^.*?:/,''))}</div>
+              <div class="small muted">${(g.items||[]).length} ocorrência(s)</div>
+            </div>
+            <div class="small muted" style="margin:2px 0 4px 0;">${escapeHtml(g.summary || '')}</div>
+            ${enrichLine}
+            ${tmplHtml ? `<div><strong class="small">Templates comuns</strong><ul style="margin:6px 0 10px 16px;">${tmplHtml}</ul></div>` : ``}
+            <details ${idx<3?'open':''}>
+              <summary class="small">Pods afetados (${pods.length})</summary>
+              <div class="table-wrap" id="${collapseId}">
+                <table>
+                  <thead><tr><th>Namespace</th><th>Pod</th><th>Ação</th></tr></thead>
+                  <tbody>${ podRows || `<tr><td colspan="3" class="muted">Sem pods encontrados.</td></tr>` }</tbody>
+                </table>
+              </div>
+            </details>
+          </div>`;
+      }).join('');
+    }
+
+    const pairs = Object.entries(info?.pods||{}).sort((a,b)=>b[1]-a[1]).slice(0, 250);
+    podsWrap.innerHTML = pairs.length ? `
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Namespace</th><th>Pod</th><th>Ocorrências</th><th>Ação</th></tr></thead>
+          <tbody>
+            ${pairs.map(([k,c])=>{ const [ns,pod]=k.split('/'); return `<tr><td>${ns}</td><td>${pod}</td><td>${c}</td><td>${podLink(ns,pod)}</td></tr>`; }).join('')}
+          </tbody>
+        </table>
+      </div>` : `<div class="empty">Sem pods para este tipo.</div>`;
+
+    const ex = info?.examples || [];
+    examplesWrap.innerHTML = ex.length ? ex.map(s=>`<li class="small">${highlightText(s)}</li>`).join('') : `<li class="empty">Sem exemplos.</li>`;
+
+    document.querySelectorAll('[data-open-pod]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        const [ns,pod] = btn.dataset.openPod.split('|');
+        openPodQuickView(ns, pod);
+      });
+    });
+  }
+
+  function setSelectedType(t){
+    selectedType = t || null;
+    selectedTypeChip.textContent = selectedType || '—';
+    detailTitleEl.innerHTML = selectedType ? `Detalhe • <strong>${selectedType}</strong>` : `Detalhe • <span class="muted">selecione um tipo de erro…</span>`;
+    [...kpisEl.querySelectorAll('.kpi')].forEach(el=> el.classList.toggle('active', el.dataset.type === selectedType));
+    if (selectedType){ fillDetailPanels(selectedType); }
+    loadCluster2D();
+  }
+
+  document.getElementById('btnClearType').addEventListener('click', ()=>{
+    selectedType = null;
+    selectedTypeChip.textContent = '—';
+    detailTitleEl.innerHTML = `Detalhe • <span class="muted">selecione um tipo de erro…</span>`;
+    entitiesWrap.innerHTML = `<div class="empty">Selecione um tipo de erro para ver as entidades e pods relacionados.</div>`;
+    podsWrap.innerHTML = `<div class="empty">Sem dados.</div>`;
+    examplesWrap.innerHTML = `<li class="empty">Sem exemplos.</li>`;
+    [...kpisEl.querySelectorAll('.kpi')].forEach(el=> el.classList.remove('active'));
+    loadCluster2D();
+  });
+
+  // ---------- Quick panel ----------
+  function openPanel(){ sp.el.classList.add('open'); sp.el.setAttribute('aria-hidden','false'); }
+  function closePanel(){ sp.el.classList.remove('open'); sp.el.setAttribute('aria-hidden','true'); }
+  sp.closeBtn.addEventListener('click', closePanel);
+
+  async function openPodQuickView(ns, pod){
+    sp.title.innerHTML = `<strong>${pod}</strong>`;
+    sp.ns.textContent = `${ns}`;
+    sp.phase.textContent = '…';
+    sp.restarts.textContent = '…';
+    sp.node.textContent = '…';
+    sp.meta.textContent = '';
+    sp.logs.textContent = 'Carregando…';
+    openPanel();
+    try{
+      const r = await fetch(`/api/pod/${encodeURIComponent(ns)}/${encodeURIComponent(pod)}`);
+      if (!r.ok){ sp.logs.textContent = `Falha (HTTP ${r.status})`; return; }
+      const d = await r.json();
+      sp.phase.textContent = `Phase: ${d.basic?.phase ?? '—'}`;
+      sp.restarts.textContent = `Restarts: ${d.basic?.restarts ?? 0}`;
+      sp.node.textContent = `Node: ${d.basic?.node_name ?? '—'}`;
+      sp.meta.textContent = `IP: ${d.basic?.pod_ip ?? '—'} • Início: ${d.basic?.start_time ?? '—'}`;
+
+      const sample = (d.logs || '').split('\n').slice(-200).join('\n');
+      sp.logs.innerHTML = sample ? highlightText(sample) : 'Sem logs.';
+    }catch(e){ sp.logs.textContent = `Erro: ${e}`; }
+  }
+
+  // ---------- Tabs ----------
+  tabsEl.addEventListener('click', (e)=>{
+    const t = e.target.closest('.tab'); if (!t) return;
+    [...document.querySelectorAll('.tab')].forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    const tab = t.dataset.tab;
+    panelByEntity.style.display = (tab==='by-entity') ? 'block' : 'none';
+    panelAllPods.style.display = (tab==='all-pods') ? 'block' : 'none';
+    panelExamples.style.display = (tab==='examples') ? 'block' : 'none';
+  });
+
+  // ---------- Cluster 2D ----------
+  const chartClusterEl = document.getElementById('chartCluster2D');
+  const cbShowOutliers = document.getElementById('cbShowOutliers');
+  const pointSizeEl = document.getElementById('pointSize');
+  const btnResetZoom = document.getElementById('btnResetZoom');
+  const btnReloadCluster = document.getElementById('btnReloadCluster');
+  const legendClustersEl = document.getElementById('legendClusters');
+  const clusterSummaryEl = document.getElementById('clusterSummary');
+  const chartErrorsByClusterEl = document.getElementById('chartErrorsByCluster');
+  const stackedTitleEl = document.getElementById('stackedTitle');
+  const clusterBlockTitleEl = document.getElementById('clusterBlockTitle');
+  let chartCluster, lastClusterPayload, chartErrorsByCluster;
+
+  function clusterColor(i){ return palette[i % palette.length]; }
+  function buildClusterDatasets(points, showOutliers, radius){
+    const byCluster = new Map();
+    points.forEach(p=>{
+      if (!showOutliers && p.outlier) return;
+      const idx = p.cluster;
+      if (!byCluster.has(idx)) byCluster.set(idx, []);
+      byCluster.get(idx).push({
+        x: p.x, y: p.y, ns: p.ns, pod: p.pod, phase: p.phase, restarts: p.restarts,
+        tags: p.tags || [], distance: p.distance, outlier: p.outlier, label: p.label, dom_type: p.dom_type, cluster: p.cluster
+      });
+    });
+    return Array.from(byCluster.keys()).sort((a,b)=>a-b).map(cid => ({
+      label: `cluster ${cid}`,
+      data: byCluster.get(cid),
+      showLine: false,
+      pointRadius: radius,
+      borderColor: clusterColor(cid),
+      backgroundColor: clusterColor(cid),
+    }));
+  }
+
+  function renderClusterLegend(datasets, payload){
+    const clusters = payload?.clusters || [];
+    const metaById = new Map(clusters.map(c => [c.cluster, c]));
+    legendClustersEl.innerHTML = datasets.map((ds,i)=>{
+      const cid = ds.label.replace('cluster ','')*1;
+      const meta = metaById.get(cid);
+      const typesStr = meta && meta.types?.length ? meta.types.slice(0,2).map(([t,c])=>`${t}(${c})`).join(', ') : '—';
+      const termsStr = meta && meta.top_terms?.length ? meta.top_terms.slice(0,3).join(', ') : '—';
+      return `
+        <span class="lg-item" data-ds="${i}" data-cid="${cid}" style="cursor:pointer;">
+          <span class="lg-dot" style="background:${ds.backgroundColor}"></span>
+          C${cid} • tipos: ${typesStr} • termos: ${termsStr} <span class="small muted">(${ds.data.length})</span>
+        </span>`;
+    }).join('') || `<span class="muted small">Sem clusters.</span>`;
+
+    legendClustersEl.querySelectorAll('[data-ds]').forEach(el=>{
+      el.addEventListener('click', ()=>{
+        const cid = +el.dataset.cid;
+        focusCluster(cid, { points: lastClusterPayload.points, clusters: (payload?.clusters||[]) });
+      });
+    });
+  }
+
+  function renderErrorsByCluster(payload){
+    const clusters = payload.clusters || [];
+    if (!clusters.length) { chartErrorsByCluster?.destroy?.(); return; }
+
+    const errType = payload?.summary?.err_type || null;
+
+    // Escolhe as "categorias" do stack dinamicamente: ou tipos, ou templates por tipo específico
+    if (!errType){
+      stackedTitleEl.textContent = 'Erros por cluster (stack)';
+      const typeTotals = new Map();
+      clusters.forEach(c => (c.types||[]).forEach(([t,cnt])=>{
+        typeTotals.set(t, (typeTotals.get(t)||0) + cnt);
+      }));
+      const topTypes = Array.from(typeTotals.entries()).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([t])=>t);
+      const labels = clusters.map(c => `C${c.cluster} (${c.size})`);
+      const datasets = topTypes.map((t, idx)=>({
+        label: t,
+        data: clusters.map(c=>{
+          const pair = (c.types||[]).find(([tt])=>tt===t);
+          return pair ? pair[1] : 0;
+        }),
+        backgroundColor: palette[idx % palette.length],
+        stack: 'stack'
+      }));
+      chartErrorsByCluster?.destroy?.();
+      chartErrorsByCluster = new Chart(chartErrorsByClusterEl, {
+        type: 'bar',
+        data: { labels, datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend:{ position:'bottom' } },
+          scales: { x:{ stacked:true }, y:{ stacked:true, beginAtZero:true } },
+          onClick: (evt, els) => {
+            if (!els?.length) return;
+            const clIdx = els[0].index;
+            const cid = clusters[clIdx].cluster;
+            focusCluster(cid, payload);
+          }
+        }
+      });
+    } else {
+      stackedTitleEl.textContent = `Templates por subcluster (${errType})`;
+      const tmplTotals = new Map();
+      clusters.forEach(c => (c.top_templates||[]).forEach(([tpl,cnt])=>{
+        tmplTotals.set(tpl, (tmplTotals.get(tpl)||0) + cnt);
+      }));
+      const topTemplates = Array.from(tmplTotals.entries()).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([t])=>t);
+      const labels = clusters.map(c => `C${c.cluster} (${c.size})`);
+      const datasets = topTemplates.map((tpl, idx)=>({
+        label: tpl,
+        data: clusters.map(c=>{
+          const pair = (c.top_templates||[]).find(([tp])=>tp===tpl);
+          return pair ? pair[1] : 0;
+        }),
+        backgroundColor: palette[idx % palette.length],
+        stack: 'stack'
+      }));
+      chartErrorsByCluster?.destroy?.();
+      chartErrorsByCluster = new Chart(chartErrorsByClusterEl, {
+        type: 'bar',
+        data: { labels, datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend:{ position:'bottom' } },
+          scales: { x:{ stacked:true }, y:{ stacked:true, beginAtZero:true } },
+          onClick: (evt, els) => {
+            if (!els?.length) return;
+            const clIdx = els[0].index;
+            const cid = clusters[clIdx].cluster;
+            focusCluster(cid, payload);
+          }
+        }
+      });
+    }
+  }
+
+  function renderClusterInfo(cid, payload){
+    const meta = (payload.clusters||[]).find(c => c.cluster === cid);
+    const body = document.getElementById('clusterInfoBody');
+    const title = document.getElementById('clusterInfoTitle');
+    if (!meta){
+      title.textContent = 'nenhum';
+      body.innerHTML = '—';
+      return;
+    }
+    title.textContent = `C${cid} • ${meta.size} pods`;
+
+    const typesHtml = (meta.types||[]).slice(0,6).map(([t,c])=>`<span class="pill">${t}: ${c}</span>`).join(' ');
+    const tagsHtml = (meta.tags||[]).slice(0,6).map(([t,c])=>`<span class="pill">${t}: ${c}</span>`).join(' ');
+    const tmplsHtml = (meta.top_templates||[]).slice(0,8).map(([txt,c]) =>
+      `<li class="small"><code>${highlightText(txt)}</code> — ${c}</li>`
+    ).join('');
+
+    const podsHtml = (meta.top_members||[]).map(m=>{
+      const id = `${m.ns}|${m.pod}`;
+      return `<tr>
+        <td style="width:34%">${m.ns}</td>
+        <td style="width:46%">${m.pod}</td>
+        <td style="width:10%;text-align:right">${m.restarts}</td>
+        <td style="width:10%">${m.dom_type}</td>
+        <td style="width:10%"><button class="btn" data-open-pod="${id}">Ver</button></td>
+      </tr>`;
+    }).join('');
+
+    body.innerHTML = `
+      <div class="row" style="gap:10px; flex-wrap:wrap; margin:6px 0;">
+        <div><strong>Tipos:</strong> ${typesHtml || '<span class="muted">—</span>'}</div>
+        <div><strong>Tags:</strong> ${tagsHtml || '<span class="muted">—</span>'}</div>
+      </div>
+      ${tmplsHtml ? `<div style="margin-top:6px;"><strong class="small">Templates comuns</strong><ul style="margin:6px 0 10px 16px;">${tmplsHtml}</ul></div>` : ``}
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead><tr><th>Namespace</th><th>Pod</th><th style="text-align:right">Restarts</th><th>Tipo</th><th>Ação</th></tr></thead>
+          <tbody>${podsHtml || `<tr><td colspan="5" class="muted">Sem pods.</td></tr>`}</tbody>
+        </table>
+      </div>
+    `;
+
+    body.querySelectorAll('[data-open-pod]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        const [ns,pod] = btn.dataset.openPod.split('|');
+        openPodQuickView(ns, pod);
+      });
+    });
+  }
+
+  function renderClusterChart(payload){
+    const { points, summary } = payload;
+    const radius = +pointSizeEl.value;
+    const showOutliers = cbShowOutliers.checked;
+
+    const datasets = buildClusterDatasets(points, showOutliers, radius);
+    chartCluster?.destroy?.();
+    chartCluster = new Chart(chartClusterEl, {
+      type: 'scatter',
+      data: { datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        parsing: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: ctx => {
+                const d = ctx.raw;
+                const tagStr = (d.tags||[]).join(', ');
+                return [
+                  `${d.ns}/${d.pod}`,
+                  `phase=${d.phase} • restarts=${d.restarts}`,
+                  `tipo=${d.dom_type} • dist=${(d.distance||0).toFixed(3)} • outlier=${d.outlier?'sim':'não'}`,
+                  tagStr ? `tags: ${tagStr}` : ''
+                ].filter(Boolean);
+              }
+            }
+          },
+          zoom: { pan: { enabled: true, mode: 'xy' }, zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'xy' } }
+        },
+        scales: { x: { title:{ display:true, text:'comp 1'} }, y: { title:{ display:true, text:'comp 2'} } },
+        onClick: (evt, els) => {
+          if (!els?.length) return;
+          const el = els[0];
+          const d = chartCluster.data.datasets[el.datasetIndex].data[el.index];
+          if (d?.ns && d?.pod){ openPodQuickView(d.ns, d.pod); }
+          const cid = d && d.cluster !== undefined ? d.cluster : null;
+          if (cid !== null) focusCluster(cid, payload);
+        }
+      }
+    });
+
+    renderClusterLegend(datasets, payload);
+    const extra = (summary?.avg_cosine_similarity!==undefined) ? ` • sim(cos) média: ${summary.avg_cosine_similarity.toFixed(2)}` : '';
+    clusterSummaryEl.textContent = `Docs: ${summary?.n_docs ?? points.length} • k: ${summary?.k ?? '—'} • Outlier p95: ${summary?.outlier_threshold ? (+summary.outlier_threshold).toFixed(4) : '—'}${extra}`;
+
+    renderErrorsByCluster(payload);
+  }
+
+  function focusCluster(cid, payload){
+    if (!chartCluster || !payload) return;
+    chartCluster.data.datasets.forEach(ds => { ds.hidden = (+(ds.label.replace('cluster ', '')) !== cid); });
+    chartCluster.update();
+    renderClusterInfo(cid, payload);
+    selectedTypeChip.textContent = selectedType ? selectedType : `Cluster C${cid}`;
+  }
+
+  async function loadCluster2D({nocache=false} = {}){
+    const params = makeParams();
+    if (kEl.value) params.set('k', kEl.value);
+    params.set('svd', svdEl.value);
+    if (selectedType) params.set('type', selectedType);
+    if (nocache) params.set('nocache','1');
+
+    clusterSummaryEl.textContent = 'Carregando clusters…';
+    const r = await fetch('/api/cluster-2d?' + params.toString());
+    if (!r.ok){ clusterSummaryEl.textContent = `Falha (HTTP ${r.status})`; return; }
+    const payload = await r.json();
+    lastClusterPayload = payload;
+
+    const errType = payload?.summary?.err_type || null;
+    clusterBlockTitleEl.textContent = errType ? `Subclusters (${errType})` : 'Clusters (dinâmico)';
+    renderClusterChart(payload);
+  }
+
+  // ---------- Init ----------
+  loadPrefs();
+  // salva preferências on-change (debounced)
+  const saveable = ['ns','limit_pods','tail','k','svd','item_limit','per_pod_limit','pointSize'];
+  saveable.forEach(id=>{
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => savePref(id, (el.type==='checkbox')? el.checked : el.value);
+    el.addEventListener('change', handler);
+    el.addEventListener('input', (e)=> {
+      if (id==='pointSize' && chartCluster){ // atualiza tamanho sem refetch
+        chartCluster.data.datasets.forEach(ds => ds.pointRadius = +pointSize.value);
+        chartCluster.update('none');
+      }
+      savePref(id, (el.type==='checkbox')? el.checked : el.value);
+    });
+  });
+  document.getElementById('cbShowOutliers').addEventListener('change', ()=>{
+    savePref('cbShowOutliers', cbShowOutliers.checked);
+    if (lastClusterPayload) renderClusterChart(lastClusterPayload);
+  });
+
+  document.addEventListener('DOMContentLoaded', async () => {
+    const start = async () => { await Promise.all([loadErrorsCommon(), loadCluster2D()]); };
+    if (window.Chart) start();
+    else {
+      const iv = setInterval(() => { if (window.Chart) { clearInterval(iv); start(); } }, 50);
+      setTimeout(()=>clearInterval(iv), 7000);
+    }
+  });
+
+  // Ações
+  runBtn?.addEventListener('click', async ()=>{ await loadCluster2D(); });
+  refreshAllBtn?.addEventListener('click', async ()=>{ await loadErrorsCommon({nocache:true}); });
+  applyDetailBtn?.addEventListener('click', async ()=>{
+    cachedGroups = null; // invalida cache local
+    if (selectedType) await fillDetailPanels(selectedType);
+  });
+  btnReloadCluster?.addEventListener('click', async ()=>{ await loadCluster2D({nocache:true}); });
+  btnResetZoom?.addEventListener('click', ()=>{ try { chartCluster?.resetZoom?.(); } catch(e){} });
+</script>
+</body>
+</html>
